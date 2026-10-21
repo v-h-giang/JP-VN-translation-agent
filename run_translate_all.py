@@ -8,10 +8,12 @@ from collections import Counter
 
 import ollama
 
-MODEL = "translategemma:12b-it-q4_K_M"
+DEFAULT_MODEL = "translategemma:4b"
+MODEL = DEFAULT_MODEL
 NUM_CTX = 4096
-MAX_CHARS = 3500
-MAX_RETRIES = 3
+MAX_CHARS = 1200
+MAX_RETRIES = 2
+NUM_PREDICT = 1536
 MODEL_KEEP_ALIVE = "30m"
 UNLOAD_MODEL_AT_EXIT = True
 MODEL_WAS_USED = False
@@ -223,6 +225,8 @@ def translate_chunk(text, glossary):
 
     for attempt in range(1, MAX_RETRIES + 1):
         MODEL_WAS_USED = True
+        started = time.perf_counter()
+
         response = ollama.chat(
             model=MODEL,
             messages=[
@@ -240,9 +244,24 @@ def translate_chunk(text, glossary):
                 "temperature": 0.1,
                 "top_k": 64,
                 "top_p": 0.95,
+                "num_predict": NUM_PREDICT,
             },
             keep_alive=MODEL_KEEP_ALIVE,
         )
+
+        elapsed = time.perf_counter() - started
+        eval_count = getattr(response, "eval_count", None)
+        eval_duration = getattr(response, "eval_duration", None)
+        load_duration = getattr(response, "load_duration", None)
+
+        perf = f"elapsed={elapsed:.1f}s"
+        if eval_count and eval_duration:
+            tokens_per_second = eval_count / (eval_duration / 1_000_000_000)
+            perf += f", output_tokens={eval_count}, speed={tokens_per_second:.2f} tok/s"
+        if load_duration:
+            perf += f", load={load_duration / 1_000_000_000:.1f}s"
+
+        print(f"  attempt {attempt}/{MAX_RETRIES}: {perf}")
 
         output = response.message.content.strip()
 
@@ -256,7 +275,8 @@ def translate_chunk(text, glossary):
             output = output + trailing
 
         tokens_ok = placeholder_ok(text, output)
-        structure_ok = structure_signature(output) == source_sig
+        target_sig = structure_signature(output)
+        structure_ok = target_sig == source_sig
 
         if tokens_ok and structure_ok:
             return output
@@ -264,7 +284,9 @@ def translate_chunk(text, glossary):
         print(
             f"  Retry {attempt}/{MAX_RETRIES}: "
             f"placeholder_ok={tokens_ok}, "
-            f"structure_ok={structure_ok}",
+            f"structure_ok={structure_ok}, "
+            f"source_structure={source_sig}, "
+            f"target_structure={target_sig}",
             file=sys.stderr,
         )
         time.sleep(0.5)
@@ -275,11 +297,16 @@ def translate_chunk(text, glossary):
     )
 
 
-def translate_file(input_path, output_path, glossary_path=None):
+def translate_file(
+    input_path,
+    output_path,
+    glossary_path=None,
+    max_chars=MAX_CHARS,
+):
     source = Path(input_path).read_text(encoding="utf-8-sig")
 
     protected, mapping = protect_markdown(source)
-    chunks = chunk_text(protected)
+    chunks = chunk_text(protected, max_chars=max_chars)
     glossary = load_glossary(glossary_path)
 
     print(f"Model              : {MODEL}")
@@ -354,7 +381,12 @@ def find_markdown_files(input_dir):
     )
 
 
-def translate_directory(input_dir, output_dir, glossary_path=None):
+def translate_directory(
+    input_dir,
+    output_dir,
+    glossary_path=None,
+    max_chars=MAX_CHARS,
+):
     input_dir = Path(input_dir)
     output_dir = Path(output_dir)
 
@@ -393,6 +425,7 @@ def translate_directory(input_dir, output_dir, glossary_path=None):
                 input_path=input_path,
                 output_path=output_path,
                 glossary_path=glossary_path,
+                max_chars=max_chars,
             )
             success += 1
         except Exception as exc:
@@ -436,8 +469,28 @@ def main():
         default=str(DEFAULT_GLOSSARY),
         help="Optional glossary JSON file. Default: ./glossary.json",
     )
+    parser.add_argument(
+        "--model",
+        default=DEFAULT_MODEL,
+        help=(
+            "Ollama model. Default: translategemma:4b. "
+            "Use translategemma:12b-it-q4_K_M for slower quality mode."
+        ),
+    )
+    parser.add_argument(
+        "--max-chars",
+        type=int,
+        default=MAX_CHARS,
+        help="Maximum source characters per request. Default: 1200.",
+    )
 
     args = parser.parse_args()
+
+    global MODEL
+    MODEL = args.model
+
+    if args.max_chars < 300:
+        parser.error("--max-chars must be at least 300")
 
     glossary_path = args.glossary
     if glossary_path and not Path(glossary_path).exists():
@@ -448,6 +501,7 @@ def main():
             input_dir=args.input_dir,
             output_dir=args.output_dir,
             glossary_path=glossary_path,
+            max_chars=args.max_chars,
         )
     finally:
         unload_model()
