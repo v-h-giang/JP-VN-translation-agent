@@ -8,6 +8,11 @@ from collections import Counter
 
 import ollama
 
+from excel_translate import (
+    EXCEL_EXTENSIONS,
+    translate_excel_file,
+)
+
 DEFAULT_MODEL = "translategemma:4b"
 MODEL = DEFAULT_MODEL
 NUM_CTX = 4096
@@ -22,7 +27,8 @@ BASE_DIR = Path(__file__).resolve().parent
 INPUT_DIR = BASE_DIR / "input"
 OUTPUT_DIR = BASE_DIR / "output"
 DEFAULT_GLOSSARY = BASE_DIR / "glossary.json"
-SUPPORTED_EXTENSIONS = {".md", ".markdown"}
+MARKDOWN_EXTENSIONS = {".md", ".markdown"}
+SUPPORTED_EXTENSIONS = MARKDOWN_EXTENSIONS | EXCEL_EXTENSIONS
 
 
 def add_protection(mapping, value):
@@ -373,11 +379,13 @@ def unload_model():
         )
 
 
-def find_markdown_files(input_dir):
+def find_supported_files(input_dir):
     return sorted(
         path
         for path in input_dir.rglob("*")
-        if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS
+        if path.is_file()
+        and path.suffix.lower() in SUPPORTED_EXTENSIONS
+        and not path.name.startswith("~$")
     )
 
 
@@ -393,7 +401,7 @@ def translate_directory(
     input_dir.mkdir(parents=True, exist_ok=True)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    files = find_markdown_files(input_dir)
+    files = find_supported_files(input_dir)
 
     print("=" * 70)
     print("TranslateGemma Markdown Batch Translator")
@@ -405,7 +413,10 @@ def translate_directory(
 
     if not files:
         print("")
-        print("No .md or .markdown files found in the input directory.")
+        print(
+            "No supported files found. "
+            "Supported: .md, .markdown, .xlsx, .xlsm, .xls, .xlsb"
+        )
         return
 
     success = 0
@@ -421,12 +432,35 @@ def translate_directory(
         print("=" * 70)
 
         try:
-            translate_file(
-                input_path=input_path,
-                output_path=output_path,
-                glossary_path=glossary_path,
-                max_chars=max_chars,
-            )
+            suffix = input_path.suffix.lower()
+
+            if suffix in MARKDOWN_EXTENSIONS:
+                translate_file(
+                    input_path=input_path,
+                    output_path=output_path,
+                    glossary_path=glossary_path,
+                    max_chars=max_chars,
+                )
+            elif suffix in EXCEL_EXTENSIONS:
+                glossary = load_glossary(glossary_path)
+
+                def excel_translate_func(text):
+                    return translate_chunk(
+                        text,
+                        glossary,
+                    )
+
+                translate_excel_file(
+                    input_path=input_path,
+                    output_path=output_path,
+                    translate_func=excel_translate_func,
+                    max_chars=max_chars,
+                )
+            else:
+                raise RuntimeError(
+                    f"Unsupported file type: {suffix}"
+                )
+
             success += 1
         except Exception as exc:
             failed += 1
@@ -449,7 +483,7 @@ def translate_directory(
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            "Translate all Markdown files Vietnamese -> Japanese "
+            "Translate Markdown and Excel files Vietnamese -> Japanese "
             "from input directory to output directory with "
             "TranslateGemma through Ollama."
         )
