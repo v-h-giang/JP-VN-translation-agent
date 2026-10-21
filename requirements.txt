@@ -1,0 +1,6 @@
+ollama
+pydantic>=2
+python-pptx>=1.0
+Pillow
+opencv-python
+numpy

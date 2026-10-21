@@ -1,0 +1,427 @@
+import argparse
+import json
+import re
+import sys
+import time
+from pathlib import Path
+from collections import Counter
+
+import ollama
+
+MODEL = "translategemma:12b-it-q4_K_M"
+NUM_CTX = 4096
+MAX_CHARS = 3500
+MAX_RETRIES = 3
+
+BASE_DIR = Path(__file__).resolve().parent
+INPUT_DIR = BASE_DIR / "input"
+OUTPUT_DIR = BASE_DIR / "output"
+DEFAULT_GLOSSARY = BASE_DIR / "glossary.json"
+SUPPORTED_EXTENSIONS = {".md", ".markdown"}
+
+
+def add_protection(mapping, value):
+    token = f"__PROTECTED_{len(mapping):06d}__"
+    mapping[token] = value
+    return token
+
+
+def protect_markdown(text):
+    mapping = {}
+
+    # Protect YAML front matter.
+    if text.startswith("---\n") or text.startswith("---\r\n"):
+        m = re.match(
+            r"\A---\s*\r?\n.*?\r?\n---\s*(?:\r?\n|$)",
+            text,
+            flags=re.S,
+        )
+        if m:
+            token = add_protection(mapping, m.group(0))
+            text = token + text[m.end():]
+
+    patterns = [
+        # Fenced code blocks.
+        r"(?ms)^(?P<fence>```|~~~)[^\n]*\n.*?^(?P=fence)[ \t]*(?:\n|$)",
+        # HTML comments.
+        r"(?s)<!--.*?-->",
+        # Markdown table separator rows.
+        r"(?m)^[ \t]*\|?[ \t]*:?-{3,}:?[ \t]*(?:\|[ \t]*:?-{3,}:?[ \t]*)+\|?[ \t]*$",
+        # Inline code.
+        r"`+[^`\n]+`+",
+        # Markdown link/image destination inside ](...).
+        r"(?<=\]\()[^)]+(?=\))",
+        # Reference link definition URL: [id]: https://...
+        r"(?m)(?<=\]:[ \t])\S+",
+        # Raw URLs.
+        r"https?://[^\s<>)\]]+",
+        # HTML/XML tags.
+        r"</?[A-Za-z][^>\n]*>",
+        # Common template/variable expressions.
+        r"\{\{.*?\}\}|\$\{.*?\}|%\{.*?\}",
+    ]
+
+    for pattern in patterns:
+        rx = re.compile(pattern)
+        text = rx.sub(
+            lambda m: add_protection(mapping, m.group(0)),
+            text,
+        )
+
+    return text, mapping
+
+
+def restore_markdown(text, mapping):
+    for token, original in mapping.items():
+        text = text.replace(token, original)
+    return text
+
+
+def structure_signature(text):
+    return {
+        "headings": len(re.findall(r"(?m)^[ \t]*#{1,6}[ \t]+", text)),
+        "ul_items": len(re.findall(r"(?m)^[ \t]*[-+*][ \t]+", text)),
+        "ol_items": len(re.findall(r"(?m)^[ \t]*\d+[.)][ \t]+", text)),
+        "quotes": len(re.findall(r"(?m)^[ \t]*>[ \t]?", text)),
+        "pipes": text.count("|"),
+        "newlines": text.count("\n"),
+    }
+
+
+def placeholder_ok(source, target):
+    src = Counter(re.findall(r"__PROTECTED_\d{6}__", source))
+    dst = Counter(re.findall(r"__PROTECTED_\d{6}__", target))
+    return src == dst
+
+
+def split_long_piece(piece, max_chars):
+    if len(piece) <= max_chars:
+        return [piece]
+
+    # Prefer sentence and newline boundaries.
+    units = re.split(r"(?<=[.!?。！？])([ \t]+)|(?<=\n)", piece)
+    units = [u for u in units if u is not None and u != ""]
+
+    result = []
+    buf = ""
+
+    for unit in units:
+        if len(buf) + len(unit) <= max_chars:
+            buf += unit
+            continue
+
+        if buf:
+            result.append(buf)
+            buf = ""
+
+        # Rare fallback for one extremely long unit.
+        if len(unit) > max_chars:
+            words = re.split(r"(\s+)", unit)
+            tmp = ""
+            for word in words:
+                if len(tmp) + len(word) > max_chars and tmp:
+                    result.append(tmp)
+                    tmp = word
+                else:
+                    tmp += word
+            if tmp:
+                buf = tmp
+        else:
+            buf = unit
+
+    if buf:
+        result.append(buf)
+
+    return result
+
+
+def chunk_text(text, max_chars=MAX_CHARS):
+    # Preserve blank-line separators.
+    pieces = re.split(r"(\r?\n(?:[ \t]*\r?\n)+)", text)
+
+    normalized = []
+    for piece in pieces:
+        if len(piece) > max_chars:
+            normalized.extend(split_long_piece(piece, max_chars))
+        else:
+            normalized.append(piece)
+
+    chunks = []
+    buf = ""
+
+    for piece in normalized:
+        if len(buf) + len(piece) <= max_chars:
+            buf += piece
+        else:
+            if buf:
+                chunks.append(buf)
+            buf = piece
+
+    if buf:
+        chunks.append(buf)
+
+    return chunks
+
+
+def load_glossary(path):
+    if not path:
+        return {}
+
+    p = Path(path)
+    if not p.exists():
+        return {}
+
+    with p.open("r", encoding="utf-8-sig") as f:
+        data = json.load(f)
+
+    if not isinstance(data, dict):
+        raise ValueError(
+            "glossary.json must be a JSON object: "
+            '{"Vietnamese term": "Japanese term"}'
+        )
+
+    return {str(k): str(v) for k, v in data.items()}
+
+
+def build_prompt(text, glossary, strict=False):
+    prompt = (
+        "You are a professional Vietnamese (vi) to Japanese (ja-JP) translator. "
+        "Your goal is to accurately convey the meaning and nuances of the original "
+        "Vietnamese text while adhering to Japanese grammar, vocabulary, and cultural sensitivities.\n"
+        "Produce only the Japanese translation, without any additional explanations or commentary.\n"
+        "Preserve the Markdown structure, line breaks, headings, list markers, table pipes, and placeholders exactly.\n"
+        "Do not translate, remove, duplicate, or alter any token in the form __PROTECTED_000000__.\n"
+    )
+
+    if glossary:
+        prompt += "Use the following terminology consistently:\n"
+        for source_term, target_term in glossary.items():
+            prompt += f'- "{source_term}" -> "{target_term}"\n'
+
+    if strict:
+        prompt += (
+            "This is a retry because the previous output damaged protected tokens "
+            "or Markdown structure. Be especially strict about preserving formatting.\n"
+        )
+
+    # TranslateGemma's published prompt format calls for two blank lines
+    # before the text to translate.
+    prompt += (
+        "Please translate the following Vietnamese text into Japanese:\n"
+        "\n\n"
+        + text
+    )
+    return prompt
+
+
+def translate_chunk(text, glossary):
+    source_sig = structure_signature(text)
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        response = ollama.chat(
+            model=MODEL,
+            messages=[
+                {
+                    "role": "user",
+                    "content": build_prompt(
+                        text,
+                        glossary,
+                        strict=(attempt > 1),
+                    ),
+                }
+            ],
+            options={
+                "num_ctx": NUM_CTX,
+                "temperature": 0.1,
+                "top_k": 64,
+                "top_p": 0.95,
+            },
+            keep_alive="30m",
+        )
+
+        output = response.message.content.strip()
+
+        # Restore only outer whitespace that strip() removed.
+        leading = re.match(r"^\s*", text).group(0)
+        trailing = re.search(r"\s*$", text).group(0)
+
+        if leading and not output.startswith(leading):
+            output = leading + output
+        if trailing and not output.endswith(trailing):
+            output = output + trailing
+
+        tokens_ok = placeholder_ok(text, output)
+        structure_ok = structure_signature(output) == source_sig
+
+        if tokens_ok and structure_ok:
+            return output
+
+        print(
+            f"  Retry {attempt}/{MAX_RETRIES}: "
+            f"placeholder_ok={tokens_ok}, "
+            f"structure_ok={structure_ok}",
+            file=sys.stderr,
+        )
+        time.sleep(0.5)
+
+    raise RuntimeError(
+        "TranslateGemma changed Markdown structure or protected tokens "
+        "after all retries."
+    )
+
+
+def translate_file(input_path, output_path, glossary_path=None):
+    source = Path(input_path).read_text(encoding="utf-8-sig")
+
+    protected, mapping = protect_markdown(source)
+    chunks = chunk_text(protected)
+    glossary = load_glossary(glossary_path)
+
+    print(f"Model              : {MODEL}")
+    print(f"Input              : {input_path}")
+    print(f"Output             : {output_path}")
+    print(f"Chunks             : {len(chunks)}")
+    print(f"Protected elements : {len(mapping)}")
+
+    translated_chunks = []
+
+    for index, chunk in enumerate(chunks, start=1):
+        if not chunk.strip():
+            translated = chunk
+        else:
+            print(
+                f"[{index}/{len(chunks)}] "
+                f"translating {len(chunk)} chars..."
+            )
+            translated = translate_chunk(chunk, glossary)
+
+        translated_chunks.append(translated)
+
+    translated = "".join(translated_chunks)
+
+    if not placeholder_ok(protected, translated):
+        raise RuntimeError(
+            "Final protected-token integrity check failed."
+        )
+
+    restored = restore_markdown(translated, mapping)
+
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(output_path).write_text(
+        restored,
+        encoding="utf-8",
+        newline="",
+    )
+
+    print("")
+    print("DONE")
+    print(f"Saved: {Path(output_path).resolve()}")
+
+
+def find_markdown_files(input_dir):
+    return sorted(
+        path
+        for path in input_dir.rglob("*")
+        if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS
+    )
+
+
+def translate_directory(input_dir, output_dir, glossary_path=None):
+    input_dir = Path(input_dir)
+    output_dir = Path(output_dir)
+
+    input_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    files = find_markdown_files(input_dir)
+
+    print("=" * 70)
+    print("TranslateGemma Markdown Batch Translator")
+    print("=" * 70)
+    print(f"Input directory  : {input_dir.resolve()}")
+    print(f"Output directory : {output_dir.resolve()}")
+    print(f"Files found      : {len(files)}")
+    print("=" * 70)
+
+    if not files:
+        print("")
+        print("No .md or .markdown files found in the input directory.")
+        return
+
+    success = 0
+    failed = 0
+
+    for file_index, input_path in enumerate(files, start=1):
+        relative_path = input_path.relative_to(input_dir)
+        output_path = output_dir / relative_path
+
+        print("")
+        print("=" * 70)
+        print(f"[FILE {file_index}/{len(files)}] {relative_path}")
+        print("=" * 70)
+
+        try:
+            translate_file(
+                input_path=input_path,
+                output_path=output_path,
+                glossary_path=glossary_path,
+            )
+            success += 1
+        except Exception as exc:
+            failed += 1
+            print(
+                f"FAILED: {relative_path}: "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+
+    print("")
+    print("=" * 70)
+    print("BATCH FINISHED")
+    print("=" * 70)
+    print(f"Success : {success}")
+    print(f"Failed  : {failed}")
+    print(f"Total   : {len(files)}")
+    print(f"Output  : {output_dir.resolve()}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description=(
+            "Translate all Markdown files Vietnamese -> Japanese "
+            "from input directory to output directory with "
+            "TranslateGemma through Ollama."
+        )
+    )
+    parser.add_argument(
+        "--input-dir",
+        default=str(INPUT_DIR),
+        help="Input directory. Default: ./input",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=str(OUTPUT_DIR),
+        help="Output directory. Default: ./output",
+    )
+    parser.add_argument(
+        "--glossary",
+        default=str(DEFAULT_GLOSSARY),
+        help="Optional glossary JSON file. Default: ./glossary.json",
+    )
+
+    args = parser.parse_args()
+
+    glossary_path = args.glossary
+    if glossary_path and not Path(glossary_path).exists():
+        glossary_path = None
+
+    translate_directory(
+        input_dir=args.input_dir,
+        output_dir=args.output_dir,
+        glossary_path=glossary_path,
+    )
+
+
+if __name__ == "__main__":
+    main()
+ 
