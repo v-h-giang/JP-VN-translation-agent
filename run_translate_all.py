@@ -404,7 +404,7 @@ def translate_directory(
     files = find_supported_files(input_dir)
 
     print("=" * 70)
-    print("TranslateGemma Markdown Batch Translator")
+    print("Local VN to JP Translation Agent")
     print("=" * 70)
     print(f"Input directory  : {input_dir.resolve()}")
     print(f"Output directory : {output_dir.resolve()}")
