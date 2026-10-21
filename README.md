@@ -1,4 +1,4 @@
-# TranslateGemma Markdown Batch Translator
+# Local VN to JP Translation Agent
 
 Local Vietnamese -> Japanese Markdown translation with
 `translategemma:4b` through Ollama by default.
