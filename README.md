@@ -1,38 +1,60 @@
 # TranslateGemma Markdown Batch Translator
 
-## Cấu trúc
+Local Vietnamese -> Japanese Markdown translation with
+`translategemma:12b-it-q4_K_M` through Ollama.
+
+## Structure
 
 ```text
-translategemma_batch_ready/
+JP-VN-translation-agent/
 ├─ input/
-│  └─ test_vi.md
 ├─ output/
-│  └─ test_jp.md
 ├─ run_translate_all.py
 ├─ glossary.json
+├─ requirements.txt
 ├─ setup.bat
-└─ run.bat
+├─ run.bat
+└─ configure_ollama_shared.bat
 ```
 
-## Lần đầu
+## First setup
 
 1. Double-click `setup.bat`.
-2. Script sẽ tự cài Ollama nếu máy chưa có và tự tải model
-   `translategemma:12b-it-q4_K_M` nếu model chưa được tải.
+2. The script creates `.venv`, installs the Python Ollama client,
+   checks the Ollama runtime/server, and downloads
+   `translategemma:12b-it-q4_K_M` if necessary.
 
-`pip install ollama` chỉ cài Python client. `setup.bat` cũng bảo đảm Ollama
-runtime/server và model đều sẵn sàng. Model tải xuống khoảng 8,1 GB, vì vậy máy
-cần kết nối Internet và đủ dung lượng trống trong lần setup đầu tiên.
+The model download is large, so the first setup requires an Internet
+connection and enough free disk space.
 
-## Mỗi lần dịch
+## Shared-machine Ollama configuration
 
-1. Copy toàn bộ file `.md` / `.markdown` cần dịch vào `input`.
+If this machine also runs other local Ollama agents/models, run
+`configure_ollama_shared.bat` once.
+
+It sets:
+
+```text
+OLLAMA_MAX_LOADED_MODELS=1
+OLLAMA_NUM_PARALLEL=1
+```
+
+Then fully quit Ollama from the Windows system tray and start it again.
+
+The translator keeps TranslateGemma loaded while the batch is active, then
+explicitly unloads it when the batch finishes or exits with an error. This
+releases RAM for other local Ollama tools.
+
+## Translate Markdown
+
+1. Copy `.md` / `.markdown` files into `input`.
 2. Double-click `run.bat`.
-3. Kết quả xuất vào `output`.
+3. Results are written under `output`.
 
-## Thư mục con
+The translator recursively scans subdirectories and preserves their relative
+directory structure.
 
-Nếu input:
+Example:
 
 ```text
 input/
@@ -43,7 +65,7 @@ input/
       └─ c.md
 ```
 
-thì output:
+becomes:
 
 ```text
 output/
@@ -54,5 +76,51 @@ output/
       └─ c.md
 ```
 
+## Markdown protection
+
+The translator protects structural/literal content such as:
+
+- YAML front matter
+- fenced code blocks
+- inline code
+- Markdown link destinations and raw URLs
+- HTML/XML tags and comments
+- Markdown table separator rows
+- common template/variable expressions
+
+Each chunk is validated after translation. Headings, list items, blockquotes,
+table pipes, and protected placeholders must remain intact. Minor line-wrap
+differences are allowed.
+
 ## Glossary
-Sửa `glossary.json` để ép thuật ngữ Việt -> Nhật thống nhất.
+
+Edit `glossary.json` to enforce consistent Vietnamese -> Japanese terminology.
+
+Example:
+
+```json
+{
+  "màn hình": "画面",
+  "chức năng": "機能"
+}
+```
+
+If `glossary.json` is missing, translation still runs without a glossary.
+
+## Command-line usage
+
+```powershell
+.\.venv\Scripts\python.exe run_translate_all.py
+```
+
+Custom directories:
+
+```powershell
+.\.venv\Scripts\python.exe run_translate_all.py --input-dir "D:\VI" --output-dir "D:\JA"
+```
+
+Custom glossary:
+
+```powershell
+.\.venv\Scripts\python.exe run_translate_all.py --glossary "D:\glossary.json"
+```
