@@ -8,7 +8,7 @@ set "OLLAMA_EXE="
 set "OLLAMA_JUST_INSTALLED="
 
 echo ============================================================
-echo TranslateGemma Markdown Batch Translator Setup
+echo Local VN to JP Translation Agent Setup
 echo ============================================================
 echo.
 
