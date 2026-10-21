@@ -3,13 +3,12 @@ setlocal EnableExtensions
 cd /d "%~dp0"
 
 set "TRANSLATE_MODEL=translategemma:12b-it-q4_K_M"
-set "PPT_MODEL=qwen3-vl:8b-instruct-q4_K_M"
-set "PPT_REQUIREMENTS=requirements.txt"
+set "REQUIREMENTS_FILE=requirements.txt"
 set "OLLAMA_EXE="
 set "OLLAMA_JUST_INSTALLED="
 
 echo ============================================================
-echo TranslateGemma + PowerPoint Rebuilder Setup
+echo TranslateGemma Markdown Batch Translator Setup
 echo ============================================================
 echo.
 
@@ -32,17 +31,17 @@ echo Updating pip...
 ".venv\Scripts\python.exe" -m pip install -U pip
 if errorlevel 1 goto :error
 
-if not exist "%PPT_REQUIREMENTS%" (
-    echo ERROR: Requirements file was not found: "%PPT_REQUIREMENTS%"
+if not exist "%REQUIREMENTS_FILE%" (
+    echo ERROR: Requirements file was not found: "%REQUIREMENTS_FILE%"
     goto :error
 )
 
-echo Installing Python dependencies for translation and PowerPoint rebuilding...
-".venv\Scripts\python.exe" -m pip install -r "%PPT_REQUIREMENTS%"
+echo Installing Python dependencies...
+".venv\Scripts\python.exe" -m pip install -r "%REQUIREMENTS_FILE%"
 if errorlevel 1 goto :error
 
-echo Verifying PowerPoint rebuilder imports...
-".venv\Scripts\python.exe" -c "import cv2, numpy, ollama; from PIL import Image; from pydantic import BaseModel; from pptx import Presentation"
+echo Verifying Python imports...
+".venv\Scripts\python.exe" -c "import ollama"
 if errorlevel 1 goto :error
 
 echo.
@@ -106,18 +105,13 @@ echo Ollama server is ready.
 call :ensure_model "%TRANSLATE_MODEL%"
 if errorlevel 1 goto :error
 
-call :ensure_model "%PPT_MODEL%"
-if errorlevel 1 goto :error
-
 echo.
 echo ============================================================
 echo SETUP COMPLETE
 echo ============================================================
 echo.
 echo Next:
-echo   Markdown translation: put Markdown files in input, then run run.bat
-echo   PowerPoint rebuild: put screenshots in input, then run:
-echo     ".venv\Scripts\python.exe" rebuild_ppt.py
+echo   Put Markdown files in input, then run run.bat
 echo.
 pause
 exit /b 0
