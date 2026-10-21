@@ -1,7 +1,7 @@
 # TranslateGemma Markdown Batch Translator
 
 Local Vietnamese -> Japanese Markdown translation with
-`translategemma:12b-it-q4_K_M` through Ollama.
+`translategemma:4b` through Ollama by default.
 
 ## Structure
 
@@ -22,7 +22,7 @@ JP-VN-translation-agent/
 1. Double-click `setup.bat`.
 2. The script creates `.venv`, installs the Python Ollama client,
    checks the Ollama runtime/server, and downloads
-   `translategemma:12b-it-q4_K_M` if necessary.
+   `translategemma:4b` if necessary.
 
 The model download is large, so the first setup requires an Internet
 connection and enough free disk space.
@@ -123,4 +123,30 @@ Custom glossary:
 
 ```powershell
 .\.venv\Scripts\python.exe run_translate_all.py --glossary "D:\glossary.json"
+```
+
+
+## Performance modes
+
+The default is the 4B Q4 model because it is much lighter on RAM and faster on
+machines with limited memory:
+
+```text
+translategemma:4b
+```
+
+Default requests use at most about 1200 source characters per chunk and retry
+at most twice. The terminal prints elapsed time, output token count, model load
+time, and generation speed when Ollama reports those metrics.
+
+For the slower 12B quality mode:
+
+```powershell
+.\.venv\Scripts\python.exe run_translate_all.py --model translategemma:12b-it-q4_K_M
+```
+
+You can also adjust chunk size:
+
+```powershell
+.\.venv\Scripts\python.exe run_translate_all.py --max-chars 800
 ```
