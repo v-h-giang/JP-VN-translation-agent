@@ -10,6 +10,7 @@ JP-VN-translation-agent/
 ├─ input/
 ├─ output/
 ├─ run_translate_all.py
+├─ excel_translate.py
 ├─ glossary.json
 ├─ requirements.txt
 ├─ setup.bat
@@ -150,3 +151,68 @@ You can also adjust chunk size:
 ```powershell
 .\.venv\Scripts\python.exe run_translate_all.py --max-chars 800
 ```
+
+
+## Excel translation
+
+Supported workbook formats:
+
+```text
+.xlsx
+.xlsm
+.xls
+.xlsb
+```
+
+Excel translation requires Windows with Microsoft Excel installed. The tool
+uses Excel COM through `pywin32`: it copies the original workbook to
+`output` first and edits the copy in Excel itself instead of reconstructing
+the workbook.
+
+The Excel path is designed to preserve:
+
+- cell formatting, number formats, fills, borders, alignment and merged cells
+- formulas (formula cells are not translated)
+- VBA in `.xlsm` files
+- text formatting inside cells, including bold/italic/color/font/size
+- text inside Excel shapes and text boxes, including per-run formatting
+- grouped shapes recursively
+
+For shape/text-box text, the tool checks the rendered text bounds after
+translation. If the translated text overflows:
+
+1. it reduces font sizes proportionally
+2. it never shrinks a formatted run below 8 pt
+3. if text still does not fit at 8 pt, it expands the object horizontally first
+4. if vertical overflow remains after horizontal expansion, it increases height
+
+The tool skips Excel temporary lock files such as `~$book.xlsx`.
+
+Example:
+
+```text
+input/
+├─ spec.md
+├─ test_cases.xlsx
+└─ design/
+   └─ notes.xlsm
+
+output/
+├─ spec.md
+├─ test_cases.xlsx
+└─ design/
+   └─ notes.xlsm
+```
+
+### Rich-text behavior
+
+If one cell or shape contains multiple formatting runs, for example:
+
+- normal text
+- **bold text**
+- colored text
+
+the translator sends protected run boundaries through TranslateGemma and then
+reapplies the original formatting to the corresponding translated run. If the
+model damages those protected boundaries, the tool falls back to translating
+each formatting run separately so formatting is not silently lost.
