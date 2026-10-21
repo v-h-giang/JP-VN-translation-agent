@@ -41,7 +41,7 @@ echo Installing Python dependencies...
 if errorlevel 1 goto :error
 
 echo Verifying Python imports...
-".venv\Scripts\python.exe" -c "import ollama"
+".venv\Scripts\python.exe" -c "import ollama, win32com.client, pythoncom"
 if errorlevel 1 goto :error
 
 echo.
