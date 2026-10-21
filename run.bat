@@ -3,7 +3,7 @@ setlocal
 cd /d "%~dp0"
 
 echo ============================================================
-echo TranslateGemma Markdown Batch Translator
+echo Local VN to JP Translation Agent
 echo ============================================================
 echo.
 
