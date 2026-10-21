@@ -12,6 +12,9 @@ MODEL = "translategemma:12b-it-q4_K_M"
 NUM_CTX = 4096
 MAX_CHARS = 3500
 MAX_RETRIES = 3
+MODEL_KEEP_ALIVE = "30m"
+UNLOAD_MODEL_AT_EXIT = True
+MODEL_WAS_USED = False
 
 BASE_DIR = Path(__file__).resolve().parent
 INPUT_DIR = BASE_DIR / "input"
@@ -84,7 +87,6 @@ def structure_signature(text):
         "ol_items": len(re.findall(r"(?m)^[ \t]*\d+[.)][ \t]+", text)),
         "quotes": len(re.findall(r"(?m)^[ \t]*>[ \t]?", text)),
         "pipes": text.count("|"),
-        "newlines": text.count("\n"),
     }
 
 
@@ -215,9 +217,12 @@ def build_prompt(text, glossary, strict=False):
 
 
 def translate_chunk(text, glossary):
+    global MODEL_WAS_USED
+
     source_sig = structure_signature(text)
 
     for attempt in range(1, MAX_RETRIES + 1):
+        MODEL_WAS_USED = True
         response = ollama.chat(
             model=MODEL,
             messages=[
@@ -236,7 +241,7 @@ def translate_chunk(text, glossary):
                 "top_k": 64,
                 "top_p": 0.95,
             },
-            keep_alive="30m",
+            keep_alive=MODEL_KEEP_ALIVE,
         )
 
         output = response.message.content.strip()
@@ -316,6 +321,29 @@ def translate_file(input_path, output_path, glossary_path=None):
     print("")
     print("DONE")
     print(f"Saved: {Path(output_path).resolve()}")
+
+
+def unload_model():
+    """Unload TranslateGemma after the batch so other local agents can use RAM."""
+    if not UNLOAD_MODEL_AT_EXIT or not MODEL_WAS_USED:
+        return
+
+    try:
+        print("")
+        print(f"Unloading Ollama model: {MODEL} ...")
+        ollama.generate(
+            model=MODEL,
+            prompt="",
+            keep_alive=0,
+        )
+        print(f"Unloaded: {MODEL}")
+    except Exception as exc:
+        # Do not turn an unload failure into a failed translation job.
+        print(
+            f"Warning: could not unload Ollama model {MODEL}: "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
 
 
 def find_markdown_files(input_dir):
@@ -415,11 +443,14 @@ def main():
     if glossary_path and not Path(glossary_path).exists():
         glossary_path = None
 
-    translate_directory(
-        input_dir=args.input_dir,
-        output_dir=args.output_dir,
-        glossary_path=glossary_path,
-    )
+    try:
+        translate_directory(
+            input_dir=args.input_dir,
+            output_dir=args.output_dir,
+            glossary_path=glossary_path,
+        )
+    finally:
+        unload_model()
 
 
 if __name__ == "__main__":
