@@ -79,22 +79,9 @@ def _cell_font_style(font):
 
 
 def _shape_font_style(font):
-    color = None
-
-    try:
-        color = font.Fill.ForeColor.RGB
-    except Exception:
-        pass
-
-    return {
-        "name": _safe_get(font, "Name"),
-        "size": _as_float(_safe_get(font, "Size")),
-        "bold": _safe_get(font, "Bold"),
-        "italic": _safe_get(font, "Italic"),
-        "underline_style": _safe_get(font, "UnderlineStyle"),
-        "strike": _safe_get(font, "Strike"),
-        "color": color,
-    }
+    # Excel Shape.TextFrame.Characters(...).Font returns the Excel Font
+    # interface, which is more stable across Excel versions than Font2.
+    return _cell_font_style(font)
 
 
 def _style_looks_mixed(style):
@@ -157,8 +144,11 @@ def _extract_cell_runs(cell, text):
     )
 
 
-def _extract_shape_runs(text_range, text):
-    whole_style = _shape_font_style(text_range.Font)
+def _extract_shape_runs(shape, text):
+    text_frame = shape.TextFrame
+    whole_style = _shape_font_style(
+        text_frame.Characters().Font
+    )
 
     if len(text) <= 1 or not _style_looks_mixed(whole_style):
         return [{"text": text, "style": whole_style}]
@@ -166,7 +156,7 @@ def _extract_shape_runs(text_range, text):
     return _merge_character_runs(
         text,
         lambda index: _shape_font_style(
-            text_range.Characters(index, 1).Font
+            text_frame.Characters(index, 1).Font
         ),
     )
 
@@ -184,19 +174,7 @@ def _apply_cell_font(font, style):
 
 
 def _apply_shape_font(font, style):
-    _safe_set(font, "Name", style.get("name"))
-    _safe_set(font, "Size", style.get("size"))
-    _safe_set(font, "Bold", style.get("bold"))
-    _safe_set(font, "Italic", style.get("italic"))
-    _safe_set(font, "UnderlineStyle", style.get("underline_style"))
-    _safe_set(font, "Strike", style.get("strike"))
-
-    color = style.get("color")
-    if color is not None:
-        try:
-            font.Fill.ForeColor.RGB = color
-        except Exception:
-            pass
+    _apply_cell_font(font, style)
 
 
 def _split_text_for_limit(text, limit):
@@ -418,20 +396,20 @@ def _write_cell_runs(cell, translated_runs):
 
 
 def _write_shape_runs(shape, translated_runs):
-    text_range = shape.TextFrame2.TextRange
-    text_range.Text = "".join(
+    text_frame = shape.TextFrame
+    characters = text_frame.Characters()
+    characters.Text = "".join(
         run["text"]
         for run in translated_runs
     )
 
-    text_range = shape.TextFrame2.TextRange
     start = 1
 
     for run in translated_runs:
         run_text = run["text"]
 
         if run_text:
-            font = text_range.Characters(
+            font = text_frame.Characters(
                 start,
                 len(run_text),
             ).Font
@@ -445,6 +423,8 @@ def _write_shape_runs(shape, translated_runs):
 
 
 def _shape_metrics(shape):
+    # TextRange2 BoundWidth/BoundHeight are documented Office members and
+    # provide the rendered text bounds. Keep TextFrame2 usage isolated here.
     text_frame = shape.TextFrame2
     text_range = text_frame.TextRange
 
@@ -504,7 +484,7 @@ def _apply_shape_font_scale(
     translated_runs,
     scale,
 ):
-    text_range = shape.TextFrame2.TextRange
+    text_frame = shape.TextFrame
     start = 1
 
     for run in translated_runs:
@@ -517,7 +497,7 @@ def _apply_shape_font_scale(
                 float(original_size) * scale,
             )
 
-            text_range.Characters(
+            text_frame.Characters(
                 start,
                 len(run_text),
             ).Font.Size = target_size
@@ -699,24 +679,36 @@ def _translate_cells(
     translated = 0
 
     for cell in _iter_text_cells(worksheet):
-        text = str(cell.Value2)
-        runs = _extract_cell_runs(
-            cell,
-            text,
-        )
+        try:
+            text = str(cell.Value2)
+            runs = _extract_cell_runs(
+                cell,
+                text,
+            )
 
-        translated_runs = translate_rich_runs(
-            runs,
-            translate_func=translate_func,
-            max_chars=max_chars,
-        )
+            translated_runs = translate_rich_runs(
+                runs,
+                translate_func=translate_func,
+                max_chars=max_chars,
+            )
 
-        _write_cell_runs(
-            cell,
-            translated_runs,
-        )
+            _write_cell_runs(
+                cell,
+                translated_runs,
+            )
 
-        translated += 1
+            translated += 1
+
+        except Exception as exc:
+            address = _safe_get(
+                cell,
+                "Address",
+                "<unknown cell>",
+            )
+            print(
+                "    WARNING: skipped Excel cell "
+                f"{address}: {type(exc).__name__}: {exc}"
+            )
 
     return translated
 
@@ -761,19 +753,17 @@ def _process_shape(
         return translated, shrunk, resized
 
     try:
-        text_frame = shape.TextFrame2
-
-        if int(text_frame.HasText) != MSO_TRUE:
-            return translated, shrunk, resized
-
-        text_range = text_frame.TextRange
-        text = str(text_range.Text or "")
+        # Use the legacy Excel TextFrame interface for text access and rich
+        # formatting. Some Excel versions/shapes expose only a subset of the
+        # Office TextFrame2/Font2 members.
+        text_frame = shape.TextFrame
+        text = str(text_frame.Characters().Text or "")
 
         if not text.strip():
             return translated, shrunk, resized
 
         runs = _extract_shape_runs(
-            text_range,
+            shape,
             text,
         )
 
