@@ -2,7 +2,7 @@
 setlocal EnableExtensions
 cd /d "%~dp0"
 
-set "TRANSLATE_MODEL=translategemma:12b-it-q4_K_M"
+set "TRANSLATE_MODEL=translategemma:4b"
 set "REQUIREMENTS_FILE=requirements.txt"
 set "OLLAMA_EXE="
 set "OLLAMA_JUST_INSTALLED="
