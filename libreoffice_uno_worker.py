@@ -1,28 +1,29 @@
-"""LibreOffice UNO worker. Run with Python that can import LibreOffice's 'uno'.
+"""LibreOffice UNO worker: sparse scan, contextual translation, checkpoints.
 
-Communication with the parent translator is newline-delimited JSON via stdio.
-The parent owns Ollama, so the UNO worker does not import third-party modules.
+Run with the Python interpreter bundled with LibreOffice. Ollama calls belong
+to the parent process; all IPC messages use ASCII-safe JSON lines.
 """
+import hashlib
 import json
+import os
 import sys
 import time
 import traceback
+import unicodedata
 from pathlib import Path
 
 import uno
 from com.sun.star.beans import PropertyValue
-# CellContentType is defined in com.sun.star.table (not .sheet).
-# Avoid importing UNO enum members as Python modules: pyuno dynamically
-# resolves them, and a wrong namespace prevents the worker from starting.
+
 CELL_TEXT = uno.Enum("com.sun.star.table.CellContentType", "TEXT")
-
-
-MIN_FONT_PT = 8.0
-MAX_RUNS = 300
-FORMAT_PROPS = (
+FONT_PROPERTIES = (
     "CharFontName", "CharHeight", "CharWeight", "CharPosture",
     "CharColor", "CharUnderline", "CharStrikeout", "CharEscapement",
 )
+MIN_FONT_PT = 8.0
+MAX_RICH_RUNS = 300
+DEFAULT_CHECKPOINT_INTERVAL = 75
+PROTOCOL_VERSION = 2
 
 
 def send(kind, **values):
@@ -33,32 +34,8 @@ def send(kind, **values):
 def receive():
     line = sys.stdin.readline()
     if not line:
-        raise RuntimeError("Parent translator closed the pipe")
+        raise RuntimeError("Translation host closed the UNO IPC channel")
     return json.loads(line)
-
-
-def is_bridge_lost(exc):
-    """Remote UNO objects are unusable after the LibreOffice process exits."""
-    details = f"{type(exc).__name__}: {exc}".lower()
-    return any(
-        phrase in details
-        for phrase in (
-            "disposedexception",
-            "bridge disposed",
-            "binary urp",
-            "connection lost",
-            "connection reset",
-            "no connection",
-        )
-    )
-
-
-def request_translation(runs):
-    send("translate", runs=runs)
-    reply = receive()
-    if not reply.get("ok"):
-        raise RuntimeError(str(reply.get("error", "translation failed")))
-    return reply["runs"]
 
 
 def prop(name, value):
@@ -75,99 +52,103 @@ def get_prop(obj, name):
         return None
 
 
-def get_runs(text_obj):
-    # LibreOffice text cursor uses Unicode codepoint offsets as reported by
-    # the UNO text range. Group contiguous text portions by font properties.
-    runs = []
+def checksum(path):
+    hasher = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            hasher.update(block)
+    return hasher.hexdigest()
 
-    def collect(container):
-        paragraphs = container.createEnumeration()
+
+def is_bridge_lost(exc):
+    text = (type(exc).__name__ + ": " + str(exc)).lower()
+    return any(key in text for key in (
+        "disposedexception", "bridge disposed", "binary urp",
+        "connection lost", "connection reset", "no connection",
+    ))
+
+
+def get_runs(text_obj):
+    full = text_obj.getString()
+    if not full:
+        return []
+    runs = []
+    try:
+        paragraphs = text_obj.createEnumeration()
         while paragraphs.hasMoreElements():
             paragraph = paragraphs.nextElement()
-            try:
-                parts = paragraph.createEnumeration()
-            except Exception:
-                continue
+            parts = paragraph.createEnumeration()
             while parts.hasMoreElements():
                 part = parts.nextElement()
-                value = part.getString()
-                if not value:
+                fragment = part.getString()
+                if not fragment:
                     continue
                 style = {}
-                for key in FORMAT_PROPS:
-                    value_prop = get_prop(part, key)
-                    if value_prop is not None:
-                        try:
-                            json.dumps(value_prop)
-                            style[key] = value_prop
-                        except TypeError:
-                            style[key] = str(value_prop)
+                for name in FONT_PROPERTIES:
+                    value = get_prop(part, name)
+                    if isinstance(value, (str, int, float, bool)):
+                        style[name] = value
                 if runs and runs[-1]["style"] == style:
-                    runs[-1]["text"] += value
+                    runs[-1]["text"] += fragment
                 else:
-                    runs.append({"text": value, "style": style})
+                    runs.append({"text": fragment, "style": style})
+                if len(runs) > MAX_RICH_RUNS:
+                    break
+            if len(runs) > MAX_RICH_RUNS:
+                break
+    except Exception:
+        runs = []
 
-    collect(text_obj)
-    full = text_obj.getString()
-
-    # If portions did not include paragraph separators, prefer a single run:
-    # preserving full text is more important than guessing style positions.
-    if "".join(r["text"] for r in runs) != full or len(runs) > MAX_RUNS:
+    # UNO text portions may omit paragraph delimiters. Never lose text:
+    # fall back to a single run when reconstruction isn't exact.
+    if len(runs) > MAX_RICH_RUNS or "".join(x["text"] for x in runs) != full:
         cursor = text_obj.createTextCursor()
-        style = {p: get_prop(cursor, p) for p in FORMAT_PROPS}
-        style = {k: v for k, v in style.items() if isinstance(v, (int, float, str, bool))}
+        style = {}
+        for name in FONT_PROPERTIES:
+            value = get_prop(cursor, name)
+            if isinstance(value, (str, int, float, bool)):
+                style[name] = value
         return [{"text": full, "style": style}]
-    return runs or [{"text": full, "style": {}}]
+    return runs
 
 
 def set_style(cursor, style):
-    for key, val in style.items():
-        if key in FORMAT_PROPS:
+    for key, value in style.items():
+        if key in FONT_PROPERTIES:
             try:
-                setattr(cursor, key, val)
+                setattr(cursor, key, value)
             except Exception:
                 pass
 
 
-def replace_text(text_obj, translated_runs):
-    translated = "".join(run["text"] for run in translated_runs)
-    text_obj.setString(translated)
-    if len(translated_runs) == 1:
-        # Cell-level formatting remains unless explicit new content inherits
-        # differently. Force the original font style onto the new text.
-        cursor = text_obj.createTextCursor()
-        cursor.gotoStart(False)
-        cursor.gotoEnd(True)
-        set_style(cursor, translated_runs[0]["style"])
-        return
-
-    cursor = text_obj.createTextCursor()
+def replace_text(target, runs):
+    text = "".join(run["text"] for run in runs)
+    target.setString(text)
+    cursor = target.createTextCursor()
     cursor.gotoStart(False)
-    for run in translated_runs:
-        size = len(run["text"])
-        if not size:
+    for run in runs:
+        if not run["text"]:
             continue
-        cursor.goRight(size, True)
+        cursor.goRight(len(run["text"]), True)
         set_style(cursor, run["style"])
         cursor.collapseToEnd()
 
 
-def cell_text(cell):
-    try:
-        cell_type = cell.getType()
-        # Compare the enum's .value as well, for pyuno versions where
-        # different enum proxy instances do not compare identically.
-        if cell_type != CELL_TEXT and getattr(cell_type, "value", None) != "TEXT":
-            return ""
-        return cell.getString()
-    except Exception:
-        return ""
+def translatable(value):
+    # Numeric, symbols and whitespace need no model call.
+    # Japanese-only text is already the requested output language.
+    if not value.strip():
+        return False
+    for char in value:
+        if unicodedata.category(char).startswith("L"):
+            code = ord(char)
+            if code <= 0x024F or 0x1E00 <= code <= 0x1EFF:
+                return True
+    return False
 
 
 def fit_shape(shape):
     try:
-        if not hasattr(shape, "getSize"):
-            return "none"
         text = shape.getString()
         if not text.strip():
             return "none"
@@ -177,207 +158,325 @@ def fit_shape(shape):
         cursor = shape.createTextCursor()
         cursor.gotoStart(False)
         cursor.gotoEnd(True)
-        base_font = get_prop(cursor, "CharHeight") or 10
-        base_font = float(base_font)
-        # Ask LibreOffice to keep text within the shape when possible.
-        for option, value in (("TextAutoGrowWidth", False),
-                              ("TextAutoGrowHeight", False),
-                              ("TextFitToSize", 0)):
-            try:
-                setattr(shape, option, value)
-            except Exception:
-                pass
-        # Real-time text metrics for arbitrary UNO drawing shapes are not
-        # universally exposed. Use approximate Japanese glyph widths and
-        # newline-sensitive height, adding a safety margin.
-        vertical_lines = str(text).split("\n")
-        font = max(MIN_FONT_PT, base_font)
-        line_width = max((sum(1.0 if ord(ch) > 255 else 0.6 for ch in line)
-                          for line in vertical_lines), default=0)
-        margin = 1.10
-        width_at_font = line_width * font * 35.28 * margin
-        height_at_font = len(vertical_lines) * font * 35.28 * 1.5
-        scale = min(1.0,
-                    original_width / max(1, width_at_font),
-                    original_height / max(1, height_at_font))
+        base_size = float(get_prop(cursor, "CharHeight") or 10)
+        font = max(MIN_FONT_PT, base_size)
+        lines = text.split("\n")
+        width_units = max((
+            sum(1 if ord(char) > 255 else 0.6 for char in line)
+            for line in lines
+        ), default=0)
+        unit_to_mm100 = 35.28
+        required_width = width_units * font * unit_to_mm100 * 1.10
+        required_height = len(lines) * font * unit_to_mm100 * 1.5
+        scale = min(
+            1.0,
+            original_width / max(required_width, 1),
+            original_height / max(required_height, 1),
+        )
         new_font = max(MIN_FONT_PT, font * scale)
         if new_font < font:
-            try:
-                cursor.CharHeight = float(new_font)
-                font = new_font
-            except Exception:
-                pass
-        required_width = int(line_width * font * 35.28 * margin)
-        required_height = int(len(vertical_lines) * font * 35.28 * 1.5)
+            cursor.CharHeight = float(new_font)
+            font = new_font
+        new_width = int(width_units * font * unit_to_mm100 * 1.10)
+        new_height = int(len(lines) * font * unit_to_mm100 * 1.5)
         resized = False
-        if required_width > original_width:
-            size.Width = required_width
+        if new_width > original_width:
+            size.Width = new_width  # Width first.
             resized = True
-        if required_height > original_height:
-            size.Height = required_height
+        if new_height > original_height:
+            size.Height = new_height
             resized = True
         if resized:
             shape.setSize(size)
             return "resized"
-        if new_font < base_font:
-            return "shrunk"
-        return "unchanged"
+        return "shrunk" if new_font < base_size else "unchanged"
     except Exception as exc:
-        send("log", text=f"Shape sizing unavailable: {exc}")
+        if is_bridge_lost(exc):
+            raise
+        send("log", text=f"Shape fit estimate unavailable: {exc}")
         return "unavailable"
 
 
-def translate_shape(shape, stats):
+def iter_text_cells(sheet, sheet_index):
+    """Query only text-filled ranges; no bounding rectangle or area cap."""
+    text_flag = uno.getConstantByName("com.sun.star.sheet.CellFlags.STRING")
+    ranges = sheet.queryContentCells(int(text_flag))
     try:
-        if shape.supportsService("com.sun.star.drawing.GroupShape"):
-            count = shape.getCount()
-            for i in range(count):
-                translate_shape(shape.getByIndex(i), stats)
-            return
-        if not hasattr(shape, "getString") or not hasattr(shape, "createTextCursor"):
-            return
-        original = shape.getString()
-        if not original.strip():
-            return
-        runs = get_runs(shape)
-        result = request_translation(runs)
-        replace_text(shape, result)
-        outcome = fit_shape(shape)
-        stats["objects"] += 1
-        if outcome == "resized":
-            stats["resized"] += 1
-        elif outcome == "shrunk":
-            stats["shrunk"] += 1
-    except Exception as exc:
-        if is_bridge_lost(exc):
-            raise RuntimeError(
-                "LibreOffice UNO connection lost while writing a drawing object"
-            ) from exc
-        stats["errors"] += 1
-        send("log", text=f"Skipped shape: {type(exc).__name__}: {exc}")
+        addresses = ranges.getRangeAddresses()
+    except Exception:
+        # An empty sheet can return a range collection with no addresses.
+        addresses = ()
+    for address in addresses:
+        for row in range(address.StartRow, address.EndRow + 1):
+            for col in range(address.StartColumn, address.EndColumn + 1):
+                cell = sheet.getCellByPosition(col, row)
+                kind = cell.getType()
+                if kind != CELL_TEXT and getattr(kind, "value", "") != "TEXT":
+                    continue
+                text = cell.getString()
+                if text.strip():
+                    yield {
+                        "id": f"C/{sheet_index}/{col}/{row}",
+                        "target": cell,
+                        "kind": "cell",
+                        "text": text,
+                    }
 
 
-def translate_sheet(sheet, stats):
-    cursor = sheet.createCursor()
-    cursor.gotoStartOfUsedArea(False)
-    cursor.gotoEndOfUsedArea(True)
-    address = cursor.getRangeAddress()
-    row_span = address.EndRow - address.StartRow + 1
-    col_span = address.EndColumn - address.StartColumn + 1
+def iter_text_shapes(sheet, sheet_index):
+    page = sheet.getDrawPage()
 
-    if row_span * col_span > 150000:
-        raise RuntimeError(
-            f"Sheet {sheet.Name} used range too large for safe cell iteration "
-            f"({row_span} x {col_span})"
-        )
-    sheet_name = str(sheet.Name)
-    for row in range(address.StartRow, address.EndRow + 1):
-        for col in range(address.StartColumn, address.EndColumn + 1):
-            cell = sheet.getCellByPosition(col, row)
-            original = cell_text(cell)
-            if not original.strip():
-                continue
-            try:
-                runs = get_runs(cell)
-                translated_runs = request_translation(runs)
-                replace_text(cell, translated_runs)
-                stats["cells"] += 1
-            except Exception as exc:
-                if is_bridge_lost(exc):
-                    raise RuntimeError(
-                        "LibreOffice UNO connection lost while writing "
-                        f"{sheet_name} cell ({col+1},{row+1}). "
-                        "The soffice process may have exited or crashed; "
-                        "the source file remains unchanged."
-                    ) from exc
-                stats["errors"] += 1
-                send("log", text=f"Skipped cell {sheet_name} ({col+1},{row+1}): "
-                     f"{type(exc).__name__}: {exc}")
+    def walk(shape, chain):
+        try:
+            if shape.supportsService("com.sun.star.drawing.GroupShape"):
+                for index in range(shape.getCount()):
+                    yield from walk(shape.getByIndex(index), chain + [index])
+                return
+            if not hasattr(shape, "getString") or not hasattr(shape, "createTextCursor"):
+                return
+            text = shape.getString()
+            if text.strip():
+                yield {
+                    "id": f"S/{sheet_index}/" + ".".join(map(str, chain)),
+                    "target": shape,
+                    "kind": "shape",
+                    "text": text,
+                }
+        except Exception as exc:
+            if is_bridge_lost(exc):
+                raise
+            send("log", text=f"Skipped unsupported shape {chain}: {exc}")
 
-    draw = sheet.getDrawPage()
-    for index in range(draw.getCount()):
-        translate_shape(draw.getByIndex(index), stats)
+    for index in range(page.getCount()):
+        yield from walk(page.getByIndex(index), [index])
+
+
+def checkpoint_paths(output):
+    return (
+        output.with_name(output.stem + ".checkpoint" + output.suffix),
+        output.with_name(output.stem + ".checkpoint.json"),
+    )
+
+
+def load_checkpoint(source_hash, output):
+    book, manifest = checkpoint_paths(output)
+    if not book.is_file() or not manifest.is_file():
+        return None
+    try:
+        with manifest.open("r", encoding="utf-8") as stream:
+            state = json.load(stream)
+        if (
+            state.get("version") != PROTOCOL_VERSION
+            or state.get("input_sha256") != source_hash
+            or state.get("book_sha256") != checksum(book)
+        ):
+            send("log", text="Checkpoint mismatch; restarting from original.")
+            return None
+        send("log", text=f"Resuming checkpoint: {len(state['processed'])} objects done")
+        return state
+    except (OSError, ValueError, KeyError) as exc:
+        send("log", text=f"Checkpoint unusable, restarting: {exc}")
+        return None
+
+
+def checkpoint_save(document, output, source_hash, processed, cache, stats, filter_name):
+    book, manifest = checkpoint_paths(output)
+    tmp_book = book.with_name(book.stem + ".writing" + book.suffix)
+    tmp_manifest = manifest.with_suffix(manifest.suffix + ".writing")
+    document.storeToURL(
+        uno.systemPathToFileUrl(str(tmp_book)),
+        (prop("FilterName", filter_name), prop("Overwrite", True)),
+    )
+    new_hash = checksum(tmp_book)
+    os.replace(tmp_book, book)
+    state = {
+        "version": PROTOCOL_VERSION,
+        "input_sha256": source_hash,
+        "book_sha256": new_hash,
+        "processed": sorted(processed),
+        "cache": cache,
+        "stats": stats,
+    }
+    with tmp_manifest.open("w", encoding="utf-8") as stream:
+        json.dump(state, stream, ensure_ascii=False)
+    os.replace(tmp_manifest, manifest)
+    send("log", text=(
+        f"Checkpoint saved: {len(processed)} objects, "
+        f"{len(cache)} unique strings cached"
+    ))
+
+
+def flush_batch(batch, cache, processed, stats):
+    if not batch:
+        return
+    unique = []
+    seen = set()
+    for item in batch:
+        for run in item["runs"]:
+            source = run["text"]
+            if not translatable(source):
+                cache[source] = source
+            elif source not in cache and source not in seen:
+                unique.append(source)
+                seen.add(source)
+
+    if unique:
+        send("translate_batch", texts=unique)
+        reply = receive()
+        if not reply.get("ok"):
+            raise RuntimeError("Batch translation failed: " + str(reply.get("error")))
+        translations = reply.get("translations")
+        if not isinstance(translations, list) or len(translations) != len(unique):
+            raise RuntimeError("Batch returned an unexpected number of translations.")
+        for original, target in zip(unique, translations):
+            if not isinstance(target, str):
+                raise RuntimeError("Batch returned a non-string translation.")
+            cache[original] = target
+
+    for item in batch:
+        runs = [
+            {"text": cache[run["text"]], "style": run["style"]}
+            for run in item["runs"]
+        ]
+        # Fail fast rather than publish an incomplete workbook.
+        replace_text(item["target"], runs)
+        if item["kind"] == "shape":
+            outcome = fit_shape(item["target"])
+            stats["objects"] += 1
+            if outcome == "shrunk":
+                stats["shrunk"] += 1
+            elif outcome == "resized":
+                stats["resized"] += 1
+        else:
+            stats["cells"] += 1
+        processed.add(item["id"])
 
 
 def connect(port):
-    local_context = uno.getComponentContext()
-    resolver = local_context.ServiceManager.createInstanceWithContext(
-        "com.sun.star.bridge.UnoUrlResolver", local_context
+    context = uno.getComponentContext()
+    resolver = context.ServiceManager.createInstanceWithContext(
+        "com.sun.star.bridge.UnoUrlResolver", context
     )
-    url = (
+    address = (
         f"uno:socket,host=127.0.0.1,port={port};urp;"
         "StarOffice.ComponentContext"
     )
-    last_error = None
     for _ in range(80):
         try:
-            context = resolver.resolve(url)
-            manager = context.ServiceManager
-            desktop = manager.createInstanceWithContext(
-                "com.sun.star.frame.Desktop", context
+            remote = resolver.resolve(address)
+            return remote.ServiceManager.createInstanceWithContext(
+                "com.sun.star.frame.Desktop", remote
             )
-            return desktop
-        except Exception as exc:
-            last_error = exc
+        except Exception:
             time.sleep(0.25)
-    raise RuntimeError(f"UNO connection failed: {last_error}")
+    raise RuntimeError("Could not connect to LibreOffice UNO listener")
 
 
 def main():
     port = int(sys.argv[1])
-    source = Path(sys.argv[2]).resolve()
+    staging = Path(sys.argv[2]).resolve()
     output = Path(sys.argv[3]).resolve()
+    original = Path(sys.argv[4]).resolve()
+    interval = int(sys.argv[5])
+    if interval < 1:
+        raise RuntimeError("Checkpoint interval must be positive.")
+
+    original_hash = checksum(original)
+    state = load_checkpoint(original_hash, output)
+    checkpoint_book, manifest = checkpoint_paths(output)
+    workbook_path = checkpoint_book if state else staging
+    processed = set(state["processed"]) if state else set()
+    cache = dict(state["cache"]) if state else {}
+    stats = dict(state["stats"]) if state else {
+        "cells": 0, "objects": 0, "shrunk": 0, "resized": 0,
+    }
+    filters = {".xlsx": "Calc MS Excel 2007 XML", ".xls": "MS Excel 97"}
+    filter_name = filters[original.suffix.lower()]
     desktop = connect(port)
     document = None
+
     try:
-        source_url = uno.systemPathToFileUrl(str(source))
         document = desktop.loadComponentFromURL(
-            source_url, "_blank", 0,
+            uno.systemPathToFileUrl(str(workbook_path)),
+            "_blank", 0,
             (
                 prop("Hidden", True),
-                # Open only the temporary staging COPY in editable mode.
-                # The original workbook is never opened for modification.
                 prop("ReadOnly", False),
                 prop("UpdateDocMode", 0),
-                # 0 = NEVER_EXECUTE; 4 would run macros without warning.
                 prop("MacroExecutionMode", 0),
             ),
         )
         if document is None:
-            raise RuntimeError(f"LibreOffice cannot open: {source}")
-        stats = {"cells": 0, "objects": 0, "shrunk": 0,
-                 "resized": 0, "errors": 0}
-        for index in range(document.Sheets.getCount()):
-            sheet = document.Sheets.getByIndex(index)
-            send("log", text=f"Sheet: {sheet.Name}")
-            translate_sheet(sheet, stats)
+            raise RuntimeError(f"LibreOffice could not open {workbook_path}")
 
-        if stats["errors"]:
-            raise RuntimeError(
-                f"UNO skipped {stats['errors']} cells/shapes. "
-                "No incomplete output workbook will be published."
+        batch = []
+        items_since_checkpoint = 0
+        discovered = 0
+        skipped = 0
+
+        def flush():
+            nonlocal batch, items_since_checkpoint
+            if not batch:
+                return
+            flush_batch(batch, cache, processed, stats)
+            items_since_checkpoint += len(batch)
+            batch = []
+            if items_since_checkpoint >= interval:
+                checkpoint_save(
+                    document, output, original_hash,
+                    processed, cache, stats, filter_name
+                )
+                items_since_checkpoint = 0
+
+        for sheet_index in range(document.Sheets.getCount()):
+            sheet = document.Sheets.getByIndex(sheet_index)
+            sheet_name = str(sheet.Name)
+            send("log", text=f"Scanning sheet: {sheet_name} (sparse text cells)")
+            for iterator in (
+                iter_text_cells(sheet, sheet_index),
+                iter_text_shapes(sheet, sheet_index),
+            ):
+                for item in iterator:
+                    discovered += 1
+                    if item["id"] in processed:
+                        skipped += 1
+                        continue
+                    item["runs"] = get_runs(item["target"])
+                    if not item["runs"]:
+                        continue
+                    batch.append(item)
+                    if len(batch) >= interval:
+                        flush()
+            flush()
+
+        if items_since_checkpoint:
+            checkpoint_save(
+                document, output, original_hash,
+                processed, cache, stats, filter_name
             )
 
-        # Only write output when translation is finished. The source never
-        # changes; a failed run does not overwrite an existing output.
-        temporary_output = output.parent / (
-            output.stem + ".partial" + output.suffix
-        )
-        filters = {".xlsx": "Calc MS Excel 2007 XML",
-                   ".xls": "MS Excel 97"}
-        filter_name = filters[source.suffix.lower()]
-        document.storeAsURL(
-            uno.systemPathToFileUrl(str(temporary_output)),
+        # Publish final workbook only after all cells and shapes complete.
+        final_tmp = output.with_name(output.stem + ".complete" + output.suffix)
+        document.storeToURL(
+            uno.systemPathToFileUrl(str(final_tmp)),
             (prop("FilterName", filter_name), prop("Overwrite", True)),
         )
-        document.close(True)
-        document = None
-        temporary_output.replace(output)
-        send("done", stats=stats)
+        os.replace(final_tmp, output)
+
+        # Final output exists; do not leave behind stale resume data.
+        for path in (checkpoint_book, manifest):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+
+        send("done", stats={
+            **stats, "candidates_scanned": discovered,
+            "resumed_skipped": skipped, "unique_strings": len(cache),
+        })
+
     finally:
         if document is not None:
-            # A lost UNO bridge cannot be used for close() or dispose().
-            # Never mask the original exception with cleanup failures.
             try:
                 document.close(True)
             except Exception:
