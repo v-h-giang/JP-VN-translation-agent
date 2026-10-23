@@ -231,7 +231,20 @@ Do not edit those files while translation is running or paused.
 Rich-text portions remain separate so formatting can be applied per
 translated run. The UNO shape overflow size calculation remains approximate.
 
-**Note:** Excel COM is still preferred when installed, but the sparse scan,
-context batching and resume functionality currently apply to the
-LibreOffice UNO backend. For consistent behavior on a LibreOffice-only
-machine, set `SPREADSHEET_BACKEND=libreoffice`.
+**Both Microsoft Excel COM and LibreOffice UNO** now implement sparse text
+scanning, global per-workbook translation cache, context batching, a checkpoint
+after every 75 completed cell/shape items, and resume using input SHA-256.
+Excel COM uses `SpecialCells` to find text constants; LibreOffice uses
+`queryContentCells(CellFlags.STRING)`. Formula and numeric cells are not
+translated. The two backends share `translation_batch.py` for ID-validated
+contextual batching.
+
+Checkpoint files use the same path convention, but the formats are backend
+specific and should not be resumed across a backend switch. Set
+`SPREADSHEET_BACKEND=excel` or `SPREADSHEET_BACKEND=libreoffice` to pin
+a backend for a long-running/resumed job. If a backend changes, move aside
+the old checkpoint pair first.
+
+Excel COM continues to preserve native Excel formatting better than the
+LibreOffice round trip. Neither backend has been integration-tested with every
+shape type or the user's specific workbooks.
