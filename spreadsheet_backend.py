@@ -7,6 +7,7 @@ installed with LibreOffice, avoiding incompatible CPython/pyuno builds.
 from __future__ import annotations
 
 import json
+import re
 import os
 import shutil
 import socket
@@ -15,7 +16,71 @@ import sys
 import tempfile
 from pathlib import Path
 
-from excel_translate import EXCEL_EXTENSIONS, translate_excel_file, translate_rich_runs
+from excel_translate import EXCEL_EXTENSIONS, translate_excel_file
+
+
+BATCH_MAX_CHARS = 1100
+CHECKPOINT_INTERVAL = 75
+
+
+def _translate_context_batch(texts, translate_func):
+    """Translate multiple strings in a contextual numbered block.
+
+    Explicit IDs enable 1:1 validation. A model that loses IDs is handled
+    through individual translations, never by guessing the mapping.
+    """
+    if not texts:
+        return []
+    results = []
+    current = []
+    current_size = 0
+
+    def translate_group(group):
+        if len(group) == 1:
+            return [translate_func(group[0])]
+        source = "\n".join(
+            f"[[SEG_{index:03d}]] {value}"
+            for index, value in enumerate(group)
+        )
+        prompt = (
+            "Translate each numbered Vietnamese segment to Japanese. "
+            "Return one line per ID. Keep IDs identical, do not merge or "
+            "drop segments. No explanations.\n" + source
+        )
+        try:
+            output = translate_func(prompt)
+            hits = re.findall(
+                r"(?m)^\s*\[\[SEG_(\d{3})\]\]\s*(.*)$", output
+            )
+            values = {}
+            for index, translated in hits:
+                number = int(index)
+                if number in values or number >= len(group):
+                    raise ValueError("Duplicate or invalid translation ID")
+                values[number] = translated
+            if len(values) != len(group):
+                raise ValueError("Incomplete contextual translation")
+            return [values[i] for i in range(len(group))]
+        except Exception as exc:
+            print(
+                "WARNING: contextual batch returned invalid mapping; "
+                f"falling back to individual strings: {exc}"
+            )
+            return [translate_func(value) for value in group]
+
+    for value in texts:
+        # Preserve the context budget and avoid one model request per cell.
+        estimated = len(value) + 24
+        if current and (current_size + estimated > BATCH_MAX_CHARS
+                        or len(current) >= 16):
+            results.extend(translate_group(current))
+            current = []
+            current_size = 0
+        current.append(value)
+        current_size += estimated
+    if current:
+        results.extend(translate_group(current))
+    return results
 
 
 def _excel_available():
@@ -169,7 +234,8 @@ def _libreoffice_translate(input_path, output_path, translate_func, max_chars):
             )
             worker = subprocess.Popen(
                 [python_exe, "-u", str(worker_file), str(port),
-                 str(staging_path), str(output_path)],
+                 str(staging_path), str(output_path), str(input_path),
+                 str(CHECKPOINT_INTERVAL)],
                 env=environment, text=True, encoding="utf-8", errors="replace",
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT, bufsize=1,
@@ -188,11 +254,12 @@ def _libreoffice_translate(input_path, output_path, translate_func, max_chars):
                     continue
 
                 kind = message.get("type")
-                if kind == "translate":
+                if kind == "translate_batch":
                     try:
-                        runs = message["runs"]
-                        result = translate_rich_runs(runs, translate_func, max_chars)
-                        reply = {"ok": True, "runs": result}
+                        translations = _translate_context_batch(
+                            message["texts"], translate_func
+                        )
+                        reply = {"ok": True, "translations": translations}
                     except Exception as exc:
                         reply = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
                     worker.stdin.write(json.dumps(reply, ensure_ascii=True) + "\n")
