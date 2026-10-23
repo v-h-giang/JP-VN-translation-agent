@@ -19,7 +19,7 @@ from excel_translate import EXCEL_EXTENSIONS, translate_excel_file, translate_ri
 
 
 def _excel_available():
-    """Probe Excel.Application, not just whether pywin32 is installed."""
+    """Require a real EXCEL.EXE installation, not a stale COM registration."""
     if os.name != "nt":
         return False
     try:
@@ -27,6 +27,14 @@ def _excel_available():
         application = win32com.client.DispatchEx("Excel.Application")
         try:
             _ = application.Version
+            program_path = Path(str(application.Path))
+            executable = program_path / "EXCEL.EXE"
+            if not executable.is_file():
+                print(
+                    "Excel COM is registered but Excel desktop executable "
+                    f"is absent: {executable}. Using LibreOffice instead."
+                )
+                return False
         finally:
             application.Quit()
         return True
@@ -214,17 +222,25 @@ def _libreoffice_translate(input_path, output_path, translate_func, max_chars):
 
 
 def translate_spreadsheet(input_path, output_path, translate_func, max_chars=1200):
-    """Excel COM if installed and working; LibreOffice UNO otherwise."""
+    """Select backend automatically; allow a manual override for diagnostics."""
     if Path(input_path).suffix.lower() not in EXCEL_EXTENSIONS:
         raise ValueError(f"Unsupported spreadsheet: {input_path}")
 
-    if _excel_available():
+    choice = os.environ.get("SPREADSHEET_BACKEND", "auto").strip().lower()
+    if choice not in {"auto", "excel", "libreoffice"}:
+        raise ValueError(
+            "SPREADSHEET_BACKEND must be auto, excel, or libreoffice"
+        )
+
+    if choice == "excel" or (choice == "auto" and _excel_available()):
         try:
             print("Spreadsheet backend : Microsoft Excel COM")
             return translate_excel_file(
                 input_path, output_path, translate_func, max_chars=max_chars
             )
         except Exception as exc:
+            if choice == "excel":
+                raise
             print(
                 "WARNING: Excel COM failed, attempting LibreOffice UNO: "
                 f"{type(exc).__name__}: {exc}"
