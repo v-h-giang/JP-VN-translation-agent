@@ -263,3 +263,20 @@ preserve the identifiers, the affected strings are translated individually,
 using spreadsheet text validation (non-empty output), instead of failing the
 whole workbook. Existing Excel/LibreOffice checkpoint files and cached
 translations remain reusable if the input file has not changed.
+
+
+## Windows checkpoint file locks (LibreOffice)
+
+The UNO backend uses **immutable, versioned checkpoint workbooks**. Each save
+creates a new `<stem>.checkpoint.<unique-id>.xlsx` file (or `.xls`).
+The `<stem>.checkpoint.json` manifest is atomically updated *after* the new
+workbook has been completely saved and hashed. This avoids WinError 5 when
+LibreOffice is still holding the previous checkpoint workbook open.
+
+A previously created fixed-name `<stem>.checkpoint.xlsx` and its JSON
+manifest are still accepted for resume. When the first new checkpoint is
+saved successfully, the manifest starts pointing to versioned files.
+Garbage collection skips locked old files rather than aborting translation;
+any remaining stale checkpoint generation can be deleted once LibreOffice has
+closed, after a successful run. **Do not delete the checkpoint JSON or its
+referenced workbook before resuming a failed run.**
