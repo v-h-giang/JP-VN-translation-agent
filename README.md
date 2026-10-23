@@ -153,66 +153,50 @@ You can also adjust chunk size:
 ```
 
 
-## Excel translation
+## Excel and LibreOffice translation
 
-Supported workbook formats:
+Supported formats: `.xlsx`, `.xls`, `.xlsm`, `.xlsb`.
 
-```text
-.xlsx
-.xlsm
-.xls
-.xlsb
-```
+The agent **automatically probes Microsoft Excel desktop**. If Excel COM is
+available it uses that backend; if unavailable or opening fails it falls back
+to the **LibreOffice UNO** backend. LibreOffice is sufficient for `.xlsx`
+and `.xls`, and Microsoft Excel is not required. Microsoft Excel is still
+recommended for files with strict layout fidelity, advanced drawings or macros.
 
-Excel translation requires Windows with Microsoft Excel installed. The tool
-uses Excel COM through `pywin32`: it copies the original workbook to
-`output` first and edits the copy in Excel itself instead of reconstructing
-the workbook.
+On Windows, install LibreOffice normally (e.g.
+`C:\Program Files\LibreOffice`); the agent detects `soffice.exe`. If
+installed elsewhere, set `LIBREOFFICE_HOME` to the installation directory.
+The UNO worker loads native Python bindings / DLLs from the installed
+LibreOffice `program` directory and uses a dedicated headless process.
+**Do not copy arbitrary LibreOffice DLLs into this repository**: they depend
+on each other and must match the LibreOffice version and Python ABI. The
+preferred dynamic dependency source is the installed LibreOffice runtime.
 
-The Excel path is designed to preserve:
+`setup.bat` installs the Ollama Python client and optionally pywin32 on
+Windows; LibreOffice does not need to be installed with pip. For UNO the
+agent probes the bundled LibreOffice Python or a compatible local Python
+interpreter which can `import uno`.
 
-- cell formatting, number formats, fills, borders, alignment and merged cells
-- formulas (formula cells are not translated)
-- VBA in `.xlsm` files
-- text formatting inside cells, including bold/italic/color/font/size
-- text inside Excel shapes and text boxes, including per-run formatting
-- grouped shapes recursively
+### Workbook protection and fidelity
 
-For shape/text-box text, the tool checks the rendered text bounds after
-translation. If the translated text overflows:
+- Source workbooks are never modified.
+- The output is written only after processing a file.
+- Formula cells and numeric cells remain unchanged.
+- Text cells, text boxes and standard drawing/group shapes are translated.
+- Where UNO exposes formatted text portions, the agent attempts to preserve
+  bold, color, italic and font size per portion.
+- If translated text exceeds shape size, the agent estimates layout, tries
+  shrinking to **at least 8pt**, then expands horizontally and then vertically.
+- The UNO sizing check is approximate, not rendered overflow measurement.
 
-1. it reduces font sizes proportionally
-2. it never shrinks a formatted run below 8 pt
-3. if text still does not fit at 8 pt, it expands the object horizontally first
-4. if vertical overflow remains after horizontal expansion, it increases height
+**Limitations:** LibreOffice may re-serialize `.xlsx` formatting and drawing
+objects, especially charts, threaded comments, SmartArt, embedded OLE,
+conditional formatting and complex shapes. Excel native formatting fidelity
+cannot be guaranteed by a LibreOffice round trip. For safety, `.xlsm`
+(macro-enabled) and `.xlsb` **require Microsoft Excel**; the LibreOffice
+fallback refuses them rather than risking macro loss or binary corruption.
+Make a backup and visually review the output before delivering a critical
+client workbook.
 
-The tool skips Excel temporary lock files such as `~$book.xlsx`.
-
-Example:
-
-```text
-input/
-├─ spec.md
-├─ test_cases.xlsx
-└─ design/
-   └─ notes.xlsm
-
-output/
-├─ spec.md
-├─ test_cases.xlsx
-└─ design/
-   └─ notes.xlsm
-```
-
-### Rich-text behavior
-
-If one cell or shape contains multiple formatting runs, for example:
-
-- normal text
-- **bold text**
-- colored text
-
-the translator sends protected run boundaries through TranslateGemma and then
-reapplies the original formatting to the corresponding translated run. If the
-model damages those protected boundaries, the tool falls back to translating
-each formatting run separately so formatting is not silently lost.
+Run normally with `run.bat`; it automatically selects the backend and
+preserves the relative input/output directory structure.
