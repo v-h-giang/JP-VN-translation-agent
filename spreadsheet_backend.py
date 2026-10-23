@@ -79,6 +79,8 @@ def _select_uno_python(program_dir):
     env = os.environ.copy()
     env["PATH"] = str(program_dir) + os.pathsep + env.get("PATH", "")
     env["PYTHONPATH"] = str(program_dir) + os.pathsep + env.get("PYTHONPATH", "")
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
 
     candidates = [
         program_dir / "python.exe",
@@ -149,6 +151,9 @@ def _libreoffice_translate(input_path, output_path, translate_func, max_chars):
     worker = None
     with tempfile.TemporaryDirectory(prefix="jpvn_uno_") as temporary:
         profile_url = (Path(temporary) / "profile").resolve().as_uri()
+        staging_path = Path(temporary) / ("source" + input_path.suffix.lower())
+        shutil.copy2(input_path, staging_path)
+        print(f"UNO editable copy   : {staging_path}")
         office_args = [
             str(soffice), "-env:UserInstallation=" + profile_url,
             "--headless", "--nologo", "--nodefault", "--norestore", "--nofirststartwizard",
@@ -164,7 +169,7 @@ def _libreoffice_translate(input_path, output_path, translate_func, max_chars):
             )
             worker = subprocess.Popen(
                 [python_exe, "-u", str(worker_file), str(port),
-                 str(input_path), str(output_path)],
+                 str(staging_path), str(output_path)],
                 env=environment, text=True, encoding="utf-8", errors="replace",
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT, bufsize=1,
@@ -190,12 +195,16 @@ def _libreoffice_translate(input_path, output_path, translate_func, max_chars):
                         reply = {"ok": True, "runs": result}
                     except Exception as exc:
                         reply = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-                    worker.stdin.write(json.dumps(reply, ensure_ascii=False) + "\n")
+                    worker.stdin.write(json.dumps(reply, ensure_ascii=True) + "\n")
                     worker.stdin.flush()
                 elif kind == "log":
                     print("  UNO: " + str(message.get("text", "")))
                 elif kind == "error":
-                    raise RuntimeError("LibreOffice UNO failed:\n" + str(message["text"]))
+                    office_code = office.poll() if office is not None else None
+                    raise RuntimeError(
+                        "LibreOffice UNO failed (soffice exit code="
+                        f"{office_code}):\n" + str(message["text"])
+                    )
                 elif kind == "done":
                     print("LibreOffice translation completed: " + str(message.get("stats", {})))
                     finished = True
