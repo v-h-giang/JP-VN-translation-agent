@@ -41,7 +41,7 @@ echo Installing Python dependencies...
 if errorlevel 1 goto :error
 
 echo Verifying Python imports...
-".venv\Scripts\python.exe" -c "import ollama, win32com.client, pythoncom"
+".venv\Scripts\python.exe" -c "import ollama"
 if errorlevel 1 goto :error
 
 echo.
@@ -111,7 +111,7 @@ echo SETUP COMPLETE
 echo ============================================================
 echo.
 echo Next:
-echo   Put Markdown files in input, then run run.bat
+echo   Put Markdown or Excel files in input, then run run.bat
 echo.
 pause
 exit /b 0
