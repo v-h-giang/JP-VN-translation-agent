@@ -8,10 +8,8 @@ from collections import Counter
 
 import ollama
 
-from excel_translate import (
-    EXCEL_EXTENSIONS,
-    translate_excel_file,
-)
+from excel_translate import EXCEL_EXTENSIONS
+from spreadsheet_backend import translate_spreadsheet
 
 DEFAULT_MODEL = "translategemma:4b"
 MODEL = DEFAULT_MODEL
@@ -450,7 +448,7 @@ def translate_directory(
                         glossary,
                     )
 
-                translate_excel_file(
+                translate_spreadsheet(
                     input_path=input_path,
                     output_path=output_path,
                     translate_func=excel_translate_func,
