@@ -200,3 +200,38 @@ client workbook.
 
 Run normally with `run.bat`; it automatically selects the backend and
 preserves the relative input/output directory structure.
+
+
+## Sparse scanning, context batching and checkpoints (LibreOffice)
+
+For LibreOffice UNO, the agent queries nonempty text cells with Calc's
+`queryContentCells(CellFlags.STRING)` instead of iterating a rectangular
+`UsedRange`. The previous 150,000-position rectangle cap has been removed.
+Formula and number cells are never sent to TranslateGemma.
+
+- Cell and shape text is deduplicated via a translation cache: identical
+  strings are translated once per workbook and reused for every occurrence.
+- Different text strings are grouped into contextual batches of at most
+  **16 strings / about 1100 characters**. Each is tagged with an ID; the
+  model must return the matching IDs. Invalid responses fall back to
+  separate strings, so text is not assigned to the wrong cell.
+- **Every 75 completed cells/objects** (default), UNO saves a checkpoint
+  workbook plus a JSON manifest including completed object IDs, cache and
+  the original input file's SHA-256.
+- On restart using the same input/output file names, checkpoints are
+  validated and processing resumes at the next unfinished object.
+- A checkpoint never overwrites the final output file; the final file is
+  published only when the whole workbook finishes successfully.
+- After successful completion, temporary checkpoint artifacts are deleted.
+
+Intermediate files in the `output` folder are named
+`<name>.checkpoint.xlsx` and `<name>.checkpoint.json` (or `.xls`).
+Do not edit those files while translation is running or paused.
+
+Rich-text portions remain separate so formatting can be applied per
+translated run. The UNO shape overflow size calculation remains approximate.
+
+**Note:** Excel COM is still preferred when installed, but the sparse scan,
+context batching and resume functionality currently apply to the
+LibreOffice UNO backend. For consistent behavior on a LibreOffice-only
+machine, set `SPREADSHEET_BACKEND=libreoffice`.
