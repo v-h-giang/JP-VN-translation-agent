@@ -248,3 +248,18 @@ the old checkpoint pair first.
 Excel COM continues to preserve native Excel formatting better than the
 LibreOffice round trip. Neither backend has been integration-tested with every
 shape type or the user's specific workbooks.
+
+
+## Spreadsheet translation validation
+
+Spreadsheet cell/shape translation uses a separate model mode from Markdown.
+It **does not** reject translations because a Japanese result happens to
+contain a numbered line (for example `1.`). Markdown structural validation
+remains enabled only for `.md` and `.markdown` files.
+
+Contextual batches still validate `[[SEG_NNN]]` identifiers to avoid
+mapping a translation onto the wrong cell. When TranslateGemma 4B does not
+preserve the identifiers, the affected strings are translated individually,
+using spreadsheet text validation (non-empty output), instead of failing the
+whole workbook. Existing Excel/LibreOffice checkpoint files and cached
+translations remain reusable if the input file has not changed.
