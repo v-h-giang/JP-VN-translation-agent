@@ -137,7 +137,10 @@ def _extract_cell_runs(cell, text):
     return _merge_character_runs(
         text,
         lambda index: _cell_font_style(
-            cell.Characters(index, 1).Font
+            cell.Characters(
+                Start=index,
+                Length=1,
+            ).Font
         ),
     )
 
@@ -154,7 +157,10 @@ def _extract_shape_runs(shape, text):
     return _merge_character_runs(
         text,
         lambda index: _shape_font_style(
-            text_frame.Characters(index, 1).Font
+            text_frame.Characters(
+                Start=index,
+                Length=1,
+            ).Font
         ),
     )
 
@@ -329,6 +335,32 @@ def translate_rich_runs(
     translate_func: Callable[[str], str],
     max_chars,
 ):
+    # Fast path: the overwhelming majority of cells/shapes use one uniform
+    # font style. Do NOT add protected rich-text markers in that case.
+    # Besides being unnecessary, small TranslateGemma models may omit the
+    # markers and trigger expensive retries.
+    if len(runs) == 1:
+        run = runs[0]
+        translated_parts = []
+
+        for piece in _split_text_for_limit(
+            run["text"],
+            max_chars,
+        ):
+            if not piece.strip():
+                translated_parts.append(piece)
+            else:
+                translated_parts.append(
+                    translate_func(piece)
+                )
+
+        return [
+            {
+                "text": "".join(translated_parts),
+                "style": dict(run["style"]),
+            }
+        ]
+
     translated_runs = []
 
     for batch in _batch_runs(runs, max_chars):
@@ -376,7 +408,14 @@ def _write_cell_runs(cell, translated_runs):
             "Translated cell text exceeds Excel's 32,767-character limit."
         )
 
+    # Assigning Value2 preserves normal cell-level formatting. For a single
+    # uniform style there is no reason to touch Range.Characters at all;
+    # avoiding it also sidesteps Excel versions where that late-bound COM
+    # member is unreliable.
     cell.Value2 = text
+
+    if len(translated_runs) == 1:
+        return
 
     start = 1
 
@@ -384,7 +423,10 @@ def _write_cell_runs(cell, translated_runs):
         run_text = run["text"]
 
         if run_text:
-            chars = cell.Characters(start, len(run_text))
+            chars = cell.Characters(
+                Start=start,
+                Length=len(run_text),
+            )
             _apply_cell_font(
                 chars.Font,
                 run["style"],
@@ -408,8 +450,8 @@ def _write_shape_runs(shape, translated_runs):
 
         if run_text:
             font = text_frame.Characters(
-                start,
-                len(run_text),
+                Start=start,
+                Length=len(run_text),
             ).Font
 
             _apply_shape_font(
@@ -496,8 +538,8 @@ def _apply_shape_font_scale(
             )
 
             text_frame.Characters(
-                start,
-                len(run_text),
+                Start=start,
+                Length=len(run_text),
             ).Font.Size = target_size
 
         start += len(run_text)
