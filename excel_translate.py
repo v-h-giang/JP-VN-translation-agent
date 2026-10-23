@@ -91,9 +91,10 @@ def _open_source_workbook(excel, input_path):
     try:
         return excel.Workbooks.Open(str(input_path), **options), None
     except Exception as original_exc:
+        first_error = original_exc
         print(
             "  Direct Excel open failed: "
-            f"{type(original_exc).__name__}: {original_exc}"
+            f"{type(original_exc).__name__}: {first_error}"
         )
         print("  Input diagnostics: " + _excel_file_diagnostics(input_path))
 
@@ -104,8 +105,8 @@ def _open_source_workbook(excel, input_path):
             "not bypass Protected View automatically. Open the file "
             "manually in Excel, review/trust it if appropriate, and save "
             "a trusted local copy before translating. "
-            f"Direct open error: {original_exc}"
-        ) from original_exc
+            f"Direct open error: {first_error}"
+        ) from first_error
 
     # run.bat starts in the repo directory, normally a short ASCII-only path.
     # The source and its original name are never modified.
@@ -135,7 +136,7 @@ def _open_source_workbook(excel, input_path):
             "Protected View, a format warning, or a recovery dialog. "
             "The agent did NOT attempt automatic repair, and it did NOT "
             "modify the input workbook. "
-            f"Original error: {original_exc}. "
+            f"Original error: {first_error}. "
             f"ASCII-copy error: {staged_exc}."
         ) from staged_exc
 
