@@ -16,7 +16,9 @@ import sys
 import tempfile
 from pathlib import Path
 
-from excel_translate import EXCEL_EXTENSIONS, translate_excel_file
+from excel_translate import EXCEL_EXTENSIONS
+from excel_optimized import translate_excel_optimized
+from translation_batch import translate_context_batch
 
 
 BATCH_MAX_CHARS = 1100
@@ -256,7 +258,7 @@ def _libreoffice_translate(input_path, output_path, translate_func, max_chars):
                 kind = message.get("type")
                 if kind == "translate_batch":
                     try:
-                        translations = _translate_context_batch(
+                        translations = translate_context_batch(
                             message["texts"], translate_func
                         )
                         reply = {"ok": True, "translations": translations}
@@ -311,7 +313,7 @@ def translate_spreadsheet(input_path, output_path, translate_func, max_chars=120
     if choice == "excel" or (choice == "auto" and _excel_available()):
         try:
             print("Spreadsheet backend : Microsoft Excel COM")
-            return translate_excel_file(
+            return translate_excel_optimized(
                 input_path, output_path, translate_func, max_chars=max_chars
             )
         except Exception as exc:
