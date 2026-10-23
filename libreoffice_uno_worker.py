@@ -26,7 +26,7 @@ FORMAT_PROPS = (
 
 
 def send(kind, **values):
-    sys.stdout.write(json.dumps({"type": kind, **values}, ensure_ascii=False) + "\n")
+    sys.stdout.write(json.dumps({"type": kind, **values}, ensure_ascii=True) + "\n")
     sys.stdout.flush()
 
 
@@ -35,6 +35,22 @@ def receive():
     if not line:
         raise RuntimeError("Parent translator closed the pipe")
     return json.loads(line)
+
+
+def is_bridge_lost(exc):
+    """Remote UNO objects are unusable after the LibreOffice process exits."""
+    details = f"{type(exc).__name__}: {exc}".lower()
+    return any(
+        phrase in details
+        for phrase in (
+            "disposedexception",
+            "bridge disposed",
+            "binary urp",
+            "connection lost",
+            "connection reset",
+            "no connection",
+        )
+    )
 
 
 def request_translation(runs):
@@ -233,6 +249,10 @@ def translate_shape(shape, stats):
         elif outcome == "shrunk":
             stats["shrunk"] += 1
     except Exception as exc:
+        if is_bridge_lost(exc):
+            raise RuntimeError(
+                "LibreOffice UNO connection lost while writing a drawing object"
+            ) from exc
         stats["errors"] += 1
         send("log", text=f"Skipped shape: {type(exc).__name__}: {exc}")
 
@@ -250,6 +270,7 @@ def translate_sheet(sheet, stats):
             f"Sheet {sheet.Name} used range too large for safe cell iteration "
             f"({row_span} x {col_span})"
         )
+    sheet_name = str(sheet.Name)
     for row in range(address.StartRow, address.EndRow + 1):
         for col in range(address.StartColumn, address.EndColumn + 1):
             cell = sheet.getCellByPosition(col, row)
@@ -262,8 +283,15 @@ def translate_sheet(sheet, stats):
                 replace_text(cell, translated_runs)
                 stats["cells"] += 1
             except Exception as exc:
+                if is_bridge_lost(exc):
+                    raise RuntimeError(
+                        "LibreOffice UNO connection lost while writing "
+                        f"{sheet_name} cell ({col+1},{row+1}). "
+                        "The soffice process may have exited or crashed; "
+                        "the source file remains unchanged."
+                    ) from exc
                 stats["errors"] += 1
-                send("log", text=f"Skipped cell {sheet.Name} ({col+1},{row+1}): "
+                send("log", text=f"Skipped cell {sheet_name} ({col+1},{row+1}): "
                      f"{type(exc).__name__}: {exc}")
 
     draw = sheet.getDrawPage()
@@ -305,8 +333,15 @@ def main():
         source_url = uno.systemPathToFileUrl(str(source))
         document = desktop.loadComponentFromURL(
             source_url, "_blank", 0,
-            (prop("Hidden", True), prop("ReadOnly", True),
-             prop("UpdateDocMode", 0), prop("MacroExecutionMode", 4)),
+            (
+                prop("Hidden", True),
+                # Open only the temporary staging COPY in editable mode.
+                # The original workbook is never opened for modification.
+                prop("ReadOnly", False),
+                prop("UpdateDocMode", 0),
+                # 0 = NEVER_EXECUTE; 4 would run macros without warning.
+                prop("MacroExecutionMode", 0),
+            ),
         )
         if document is None:
             raise RuntimeError(f"LibreOffice cannot open: {source}")
@@ -316,6 +351,12 @@ def main():
             sheet = document.Sheets.getByIndex(index)
             send("log", text=f"Sheet: {sheet.Name}")
             translate_sheet(sheet, stats)
+
+        if stats["errors"]:
+            raise RuntimeError(
+                f"UNO skipped {stats['errors']} cells/shapes. "
+                "No incomplete output workbook will be published."
+            )
 
         # Only write output when translation is finished. The source never
         # changes; a failed run does not overwrite an existing output.
@@ -335,10 +376,15 @@ def main():
         send("done", stats=stats)
     finally:
         if document is not None:
+            # A lost UNO bridge cannot be used for close() or dispose().
+            # Never mask the original exception with cleanup failures.
             try:
                 document.close(True)
             except Exception:
-                document.dispose()
+                try:
+                    document.dispose()
+                except Exception:
+                    pass
 
 
 if __name__ == "__main__":
