@@ -191,41 +191,71 @@ def load_glossary(path):
     return {str(k): str(v) for k, v in data.items()}
 
 
-def build_prompt(text, glossary, strict=False):
+def build_prompt(text, glossary, strict=False, mode="markdown"):
+    """Build a mode-specific prompt; spreadsheet text is not Markdown."""
+    if mode not in {"markdown", "spreadsheet"}:
+        raise ValueError(f"Unsupported translation mode: {mode}")
+
     prompt = (
         "You are a professional Vietnamese (vi) to Japanese (ja-JP) translator. "
-        "Your goal is to accurately convey the meaning and nuances of the original "
-        "Vietnamese text while adhering to Japanese grammar, vocabulary, and cultural sensitivities.\n"
-        "Produce only the Japanese translation, without any additional explanations or commentary.\n"
-        "Preserve the Markdown structure, line breaks, headings, list markers, table pipes, and placeholders exactly.\n"
-        "Do not translate, remove, duplicate, or alter any token in the form __PROTECTED_000000__.\n"
+        "Produce only the translated Japanese text, with no commentary.\n"
     )
 
+    if mode == "markdown":
+        prompt += (
+            "Preserve Markdown structure, headings, list markers, table pipes, "
+            "links, line breaks and protected placeholders exactly.\n"
+            "Do not remove, duplicate, translate or alter any "
+            "__PROTECTED_000000__ token.\n"
+        )
+    else:
+        prompt += (
+            "This is spreadsheet cell or drawing text, NOT Markdown. "
+            "Translate its content naturally. Do not add explanations, "
+            "headings, numbering or bullet markers that were not in the source. "
+            "Preserve existing identifiers, numbers and line breaks when relevant. "
+            "If the input contains [[SEG_NNN]] identifiers, copy those IDs "
+            "verbatim and keep exactly one corresponding line per identifier.\n"
+        )
+
     if glossary:
-        prompt += "Use the following terminology consistently:\n"
+        prompt += "Use this terminology consistently:\n"
         for source_term, target_term in glossary.items():
             prompt += f'- "{source_term}" -> "{target_term}"\n'
 
     if strict:
-        prompt += (
-            "This is a retry because the previous output damaged protected tokens "
-            "or Markdown structure. Be especially strict about preserving formatting.\n"
-        )
+        if mode == "markdown":
+            prompt += (
+                "Retry: the previous output changed Markdown structure or "
+                "protected tokens. Preserve those elements exactly.\n"
+            )
+        else:
+            prompt += (
+                "Retry: return a nonempty translation with no added "
+                "explanations or formatting.\n"
+            )
 
-    # TranslateGemma's published prompt format calls for two blank lines
-    # before the text to translate.
+    # TranslateGemma expects blank lines between task and source text.
     prompt += (
         "Please translate the following Vietnamese text into Japanese:\n"
-        "\n\n"
-        + text
+        "\n\n" + text
     )
     return prompt
 
 
-def translate_chunk(text, glossary):
+def translate_chunk(text, glossary, mode="markdown"):
+    """Translate with structural validation ONLY for Markdown.
+
+    Excel/UNO workbook text may legitimately resemble Markdown numbering
+    after translation, so Markdown list/heading counters must never reject
+    a spreadsheet translation.
+    """
     global MODEL_WAS_USED
 
-    source_sig = structure_signature(text)
+    if mode not in {"markdown", "spreadsheet"}:
+        raise ValueError(f"Unsupported translation mode: {mode}")
+
+    source_sig = structure_signature(text) if mode == "markdown" else None
 
     for attempt in range(1, MAX_RETRIES + 1):
         MODEL_WAS_USED = True
@@ -240,6 +270,7 @@ def translate_chunk(text, glossary):
                         text,
                         glossary,
                         strict=(attempt > 1),
+                        mode=mode,
                     ),
                 }
             ],
@@ -261,43 +292,58 @@ def translate_chunk(text, glossary):
         perf = f"elapsed={elapsed:.1f}s"
         if eval_count and eval_duration:
             tokens_per_second = eval_count / (eval_duration / 1_000_000_000)
-            perf += f", output_tokens={eval_count}, speed={tokens_per_second:.2f} tok/s"
+            perf += (
+                f", output_tokens={eval_count}, "
+                f"speed={tokens_per_second:.2f} tok/s"
+            )
         if load_duration:
             perf += f", load={load_duration / 1_000_000_000:.1f}s"
-
         print(f"  attempt {attempt}/{MAX_RETRIES}: {perf}")
 
-        output = response.message.content.strip()
+        output = (response.message.content or "").strip()
 
-        # Restore only outer whitespace that strip() removed.
-        leading = re.match(r"^\s*", text).group(0)
-        trailing = re.search(r"\s*$", text).group(0)
+        # Only Markdown requires its original surrounding whitespace intact.
+        if mode == "markdown":
+            leading = re.match(r"^\s*", text).group(0)
+            trailing = re.search(r"\s*$", text).group(0)
+            if leading and not output.startswith(leading):
+                output = leading + output
+            if trailing and not output.endswith(trailing):
+                output += trailing
 
-        if leading and not output.startswith(leading):
-            output = leading + output
-        if trailing and not output.endswith(trailing):
-            output = output + trailing
+            tokens_ok = placeholder_ok(text, output)
+            target_sig = structure_signature(output)
+            structure_ok = target_sig == source_sig
 
-        tokens_ok = placeholder_ok(text, output)
-        target_sig = structure_signature(output)
-        structure_ok = target_sig == source_sig
+            if output.strip() and tokens_ok and structure_ok:
+                return output
 
-        if tokens_ok and structure_ok:
-            return output
+            print(
+                f"  Retry {attempt}/{MAX_RETRIES}: "
+                f"placeholder_ok={tokens_ok}, "
+                f"structure_ok={structure_ok}, "
+                f"source_structure={source_sig}, "
+                f"target_structure={target_sig}",
+                file=sys.stderr,
+            )
+        else:
+            # Spreadsheet segments are ordinary text: do not apply
+            # Markdown-specific heading/list/table constraints to them.
+            if output:
+                return output
+            print(
+                f"  Retry {attempt}/{MAX_RETRIES}: "
+                "spreadsheet translation returned empty text",
+                file=sys.stderr,
+            )
 
-        print(
-            f"  Retry {attempt}/{MAX_RETRIES}: "
-            f"placeholder_ok={tokens_ok}, "
-            f"structure_ok={structure_ok}, "
-            f"source_structure={source_sig}, "
-            f"target_structure={target_sig}",
-            file=sys.stderr,
-        )
-        time.sleep(0.5)
+        if attempt < MAX_RETRIES:
+            time.sleep(0.5)
 
     raise RuntimeError(
-        "TranslateGemma changed Markdown structure or protected tokens "
-        "after all retries."
+        "TranslateGemma returned invalid Markdown markup"
+        if mode == "markdown"
+        else "TranslateGemma returned an empty spreadsheet translation"
     )
 
 
@@ -446,6 +492,7 @@ def translate_directory(
                     return translate_chunk(
                         text,
                         glossary,
+                        mode="spreadsheet",
                     )
 
                 translate_spreadsheet(
