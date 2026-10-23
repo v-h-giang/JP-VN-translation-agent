@@ -11,8 +11,10 @@ from pathlib import Path
 
 import uno
 from com.sun.star.beans import PropertyValue
-from com.sun.star.sheet.CellContentType import TEXT as CELL_TEXT
-from com.sun.star.awt.FontWeight import BOLD as BOLD_WEIGHT
+# CellContentType is defined in com.sun.star.table (not .sheet).
+# Avoid importing UNO enum members as Python modules: pyuno dynamically
+# resolves them, and a wrong namespace prevents the worker from starting.
+CELL_TEXT = uno.Enum("com.sun.star.table.CellContentType", "TEXT")
 
 
 MIN_FONT_PT = 8.0
@@ -136,7 +138,10 @@ def replace_text(text_obj, translated_runs):
 
 def cell_text(cell):
     try:
-        if cell.getType() != CELL_TEXT:
+        cell_type = cell.getType()
+        # Compare the enum's .value as well, for pyuno versions where
+        # different enum proxy instances do not compare identically.
+        if cell_type != CELL_TEXT and getattr(cell_type, "value", None) != "TEXT":
             return ""
         return cell.getString()
     except Exception:
