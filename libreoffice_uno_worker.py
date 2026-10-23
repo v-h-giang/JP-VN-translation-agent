@@ -10,6 +10,7 @@ import sys
 import time
 import traceback
 import unicodedata
+import uuid
 from pathlib import Path
 
 import uno
@@ -252,46 +253,118 @@ def iter_text_shapes(sheet, sheet_index):
 
 
 def checkpoint_paths(output):
+    """Legacy checkpoint path plus atomic manifest path.
+
+    The fixed .checkpoint.xlsx name is retained ONLY for reading checkpoints
+    created before versioned storage. New checkpoint workbooks always receive
+    a unique filename, never overwritten while LibreOffice has one open.
+    """
     return (
         output.with_name(output.stem + ".checkpoint" + output.suffix),
         output.with_name(output.stem + ".checkpoint.json"),
     )
 
 
+def _checkpoint_file_for_state(output, state):
+    legacy_book, _ = checkpoint_paths(output)
+    filename = state.get("book_file")
+    if filename is None:
+        return legacy_book
+
+    # The manifest is local state, but validate it before opening anything:
+    # never allow reading outside the workbook's output directory.
+    if not isinstance(filename, str):
+        raise ValueError("Invalid checkpoint workbook filename")
+    prefix = output.stem + ".checkpoint."
+    if (
+        Path(filename).name != filename
+        or not filename.startswith(prefix)
+        or not filename.endswith(output.suffix)
+        or len(filename) <= len(prefix) + len(output.suffix)
+    ):
+        raise ValueError("Unsafe checkpoint workbook filename")
+    return output.with_name(filename)
+
+
 def load_checkpoint(source_hash, output):
-    book, manifest = checkpoint_paths(output)
-    if not book.is_file() or not manifest.is_file():
+    _, manifest = checkpoint_paths(output)
+    if not manifest.is_file():
         return None
     try:
         with manifest.open("r", encoding="utf-8") as stream:
             state = json.load(stream)
+        book = _checkpoint_file_for_state(output, state)
         if (
             state.get("version") != PROTOCOL_VERSION
             or state.get("input_sha256") != source_hash
+            or not book.is_file()
             or state.get("book_sha256") != checksum(book)
         ):
             send("log", text="Checkpoint mismatch; restarting from original.")
             return None
-        send("log", text=f"Resuming checkpoint: {len(state['processed'])} objects done")
+
+        # Transient key for selecting the exact file to open on resume.
+        # Old fixed-name checkpoints remain readable without modification.
+        state["_checkpoint_path"] = str(book)
+        send(
+            "log",
+            text=f"Resuming checkpoint: {len(state['processed'])} objects done "
+                 f"from {book.name}",
+        )
         return state
-    except (OSError, ValueError, KeyError) as exc:
+    except (OSError, ValueError, KeyError, TypeError) as exc:
         send("log", text=f"Checkpoint unusable, restarting: {exc}")
         return None
 
 
-def checkpoint_save(document, output, source_hash, processed, cache, stats, filter_name):
-    book, manifest = checkpoint_paths(output)
-    tmp_book = book.with_name(book.stem + ".writing" + book.suffix)
-    tmp_manifest = manifest.with_suffix(manifest.suffix + ".writing")
-    document.storeToURL(
-        uno.systemPathToFileUrl(str(tmp_book)),
-        (prop("FilterName", filter_name), prop("Overwrite", True)),
+def _clean_old_checkpoint_books(output, keep=None):
+    """Best-effort garbage collection, after a committed manifest update.
+
+    A workbook currently open by soffice may remain locked on Windows. Its
+    deletion is safely deferred until LibreOffice closes the document.
+    """
+    legacy_book, _ = checkpoint_paths(output)
+    candidates = [legacy_book]
+    candidates.extend(
+        output.parent.glob(output.stem + ".checkpoint.*" + output.suffix)
     )
-    new_hash = checksum(tmp_book)
-    os.replace(tmp_book, book)
+    for candidate in candidates:
+        if keep is not None and candidate == keep:
+            continue
+        try:
+            candidate.unlink()
+        except FileNotFoundError:
+            pass
+        except PermissionError:
+            # An old checkpoint is still open in the UNO document.
+            # Never fail translation because garbage collection was blocked.
+            pass
+
+
+def checkpoint_save(document, output, source_hash, processed, cache, stats, filter_name):
+    # Never overwrite a checkpoint workbook. On Windows an old checkpoint
+    # can be locked for the ENTIRE duration of resume because it is the
+    # source file of the open UNO document.
+    _, manifest = checkpoint_paths(output)
+    token = uuid.uuid4().hex
+    book = output.with_name(
+        output.stem + ".checkpoint." + token + output.suffix
+    )
+    tmp_manifest = output.with_name(
+        manifest.name + "." + token + ".writing"
+    )
+
+    # storeToURL keeps the active document associated with its original
+    # loaded path, which must not be replaced while still open.
+    document.storeToURL(
+        uno.systemPathToFileUrl(str(book)),
+        (prop("FilterName", filter_name), prop("Overwrite", False)),
+    )
+    new_hash = checksum(book)
     state = {
         "version": PROTOCOL_VERSION,
         "input_sha256": source_hash,
+        "book_file": book.name,
         "book_sha256": new_hash,
         "processed": sorted(processed),
         "cache": cache,
@@ -299,11 +372,22 @@ def checkpoint_save(document, output, source_hash, processed, cache, stats, filt
     }
     with tmp_manifest.open("w", encoding="utf-8") as stream:
         json.dump(state, stream, ensure_ascii=False)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+    # Publish the pointer LAST. If the worker is killed before this step,
+    # the previous checkpoint manifest and workbook remain consistent.
     os.replace(tmp_manifest, manifest)
-    send("log", text=(
-        f"Checkpoint saved: {len(processed)} objects, "
-        f"{len(cache)} unique strings cached"
-    ))
+
+    # Only clean after manifest points to the new, fully-written workbook.
+    # Locked source checkpoint files are ignored until process shutdown.
+    _clean_old_checkpoint_books(output, keep=book)
+
+    send(
+        "log",
+        text=f"Checkpoint saved: {len(processed)} objects, "
+             f"{len(cache)} unique strings cached ({book.name})",
+    )
 
 
 def flush_batch(batch, cache, processed, stats):
@@ -384,7 +468,7 @@ def main():
     original_hash = checksum(original)
     state = load_checkpoint(original_hash, output)
     checkpoint_book, manifest = checkpoint_paths(output)
-    workbook_path = checkpoint_book if state else staging
+    workbook_path = Path(state["_checkpoint_path"]) if state else staging
     processed = set(state["processed"]) if state else set()
     cache = dict(state["cache"]) if state else {}
     stats = dict(state["stats"]) if state else {
@@ -463,12 +547,20 @@ def main():
         )
         os.replace(final_tmp, output)
 
-        # Final output exists; do not leave behind stale resume data.
-        for path in (checkpoint_book, manifest):
-            try:
-                path.unlink()
-            except FileNotFoundError:
-                pass
+        # Release the input checkpoint before attempting cleanup; Windows
+        # denies deleting or replacing an open LibreOffice workbook.
+        document.close(True)
+        document = None
+
+        # The final workbook is safely published. Remove manifest first,
+        # then stale generation files; cleanup is best-effort.
+        try:
+            manifest.unlink()
+        except FileNotFoundError:
+            pass
+        except PermissionError as exc:
+            send("log", text=f"Checkpoint manifest cleanup deferred: {exc}")
+        _clean_old_checkpoint_books(output)
 
         send("done", stats={
             **stats, "candidates_scanned": discovered,
