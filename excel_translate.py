@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import os
 import re
-import shutil
-import stat
 from pathlib import Path
 from typing import Callable
 
@@ -849,23 +847,15 @@ def translate_excel_file(
             "Excel input and output paths must be different."
         )
 
+    if not input_path.exists():
+        raise FileNotFoundError(
+            f"Excel input file does not exist: {input_path}"
+        )
+
     output_path.parent.mkdir(
         parents=True,
         exist_ok=True,
     )
-
-    shutil.copy2(
-        input_path,
-        output_path,
-    )
-
-    try:
-        output_path.chmod(
-            output_path.stat().st_mode
-            | stat.S_IWRITE
-        )
-    except OSError:
-        pass
 
     pythoncom, win32com_client = _load_excel_com()
 
@@ -896,15 +886,60 @@ def translate_excel_file(
         except Exception:
             pass
 
-        workbook = excel.Workbooks.Open(
-            str(output_path),
-            UpdateLinks=0,
-            ReadOnly=False,
-            IgnoreReadOnlyRecommended=True,
-            AddToMru=False,
-        )
+        print(f"Excel input        : {input_path}")
+        print(f"Excel output       : {output_path}")
 
-        print(f"Excel              : {input_path.name}")
+        # Open the ORIGINAL workbook read-only first. This is substantially
+        # more reliable than copying the file with shutil and asking Excel to
+        # reopen the copied bytes, especially for files that are open in
+        # another Excel window, OneDrive/network files, and legacy formats.
+        try:
+            workbook = excel.Workbooks.Open(
+                str(input_path),
+                UpdateLinks=0,
+                ReadOnly=True,
+                IgnoreReadOnlyRecommended=True,
+                AddToMru=False,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "Excel could not open the input workbook. "
+                "Close any password/protected/recovery dialogs and verify "
+                f"that Excel can open this file manually: {input_path}. "
+                f"Original COM error: {type(exc).__name__}: {exc}"
+            ) from exc
+
+        source_format = workbook.FileFormat
+
+        # Excel itself creates the output workbook. This preserves workbook
+        # internals, drawings, macros, and the exact Excel file format much
+        # more safely than a filesystem byte copy + reopen.
+        if output_path.exists():
+            try:
+                output_path.unlink()
+            except OSError as exc:
+                raise RuntimeError(
+                    "Cannot replace the existing output workbook. "
+                    "Close it in Excel or another program and retry: "
+                    f"{output_path}"
+                ) from exc
+
+        try:
+            workbook.SaveAs(
+                str(output_path),
+                FileFormat=source_format,
+                AddToMru=False,
+                Local=True,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "Excel opened the input workbook but could not create the "
+                f"output workbook: {output_path}. "
+                f"Original COM error: {type(exc).__name__}: {exc}"
+            ) from exc
+
+        print(f"Excel opened       : {input_path.name}")
+        print(f"Excel saved copy   : {output_path.name}")
 
         for index in range(
             1,
