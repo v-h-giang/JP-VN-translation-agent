@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
+import tempfile
+import zipfile
 from pathlib import Path
 from typing import Callable
 
@@ -17,6 +20,124 @@ FIT_TOLERANCE_PT = 1.0
 MAX_FONT_FIT_STEPS = 6
 
 PROTECTED_TOKEN_RE = re.compile(r"__PROTECTED_\d{6}__")
+
+
+def _excel_file_diagnostics(path):
+    """Inspect source bytes without modifying or opening the workbook."""
+    notes = [f"path_length={len(str(path))}", f"bytes={path.stat().st_size}"]
+
+    if path.suffix.lower() in {".xlsx", ".xlsm", ".xlsb"}:
+        if zipfile.is_zipfile(path):
+            try:
+                with zipfile.ZipFile(path) as archive:
+                    names = set(archive.namelist())
+                expected = (
+                    "xl/workbook.bin"
+                    if path.suffix.lower() == ".xlsb"
+                    else "xl/workbook.xml"
+                )
+                if expected in names:
+                    notes.append("OOXML package: structure detected")
+                else:
+                    notes.append(
+                        f"WARNING: Excel package missing {expected}"
+                    )
+            except (OSError, zipfile.BadZipFile) as exc:
+                notes.append(
+                    f"WARNING: cannot inspect ZIP package: {exc}"
+                )
+        else:
+            with path.open("rb") as handle:
+                magic = handle.read(8)
+            if magic.startswith(bytes.fromhex("D0CF11E0A1B11AE1")):
+                notes.append(
+                    "OLE container detected despite modern Excel extension "
+                    "(possibly encrypted workbook)"
+                )
+            else:
+                notes.append(
+                    "WARNING: not an Excel OOXML ZIP package; extension "
+                    "may not match file contents"
+                )
+
+    return "; ".join(notes)
+
+
+def _has_mark_of_web(path):
+    """Do not silently bypass Windows Protected View by copying blocked files."""
+    if os.name != "nt":
+        return False
+    try:
+        with open(str(path) + ":Zone.Identifier", "rb") as mark:
+            return bool(mark.read(256))
+    except OSError:
+        return False
+
+
+def _open_source_workbook(excel, input_path):
+    """Open original, or retry a temporary ASCII-named working copy.
+
+    The copy stays open only until SaveAs creates the output workbook.
+    We deliberately do not use Excel's destructive repair modes.
+    """
+    options = {
+        "UpdateLinks": 0,
+        "ReadOnly": True,
+        "IgnoreReadOnlyRecommended": True,
+        "AddToMru": False,
+        "Notify": False,
+    }
+
+    try:
+        return excel.Workbooks.Open(str(input_path), **options), None
+    except Exception as original_exc:
+        print(
+            "  Direct Excel open failed: "
+            f"{type(original_exc).__name__}: {original_exc}"
+        )
+        print("  Input diagnostics: " + _excel_file_diagnostics(input_path))
+
+    if _has_mark_of_web(input_path):
+        raise RuntimeError(
+            "Excel refused the original file and Windows marks it as "
+            "downloaded/untrusted (Zone.Identifier). The translator will "
+            "not bypass Protected View automatically. Open the file "
+            "manually in Excel, review/trust it if appropriate, and save "
+            "a trusted local copy before translating. "
+            f"Direct open error: {original_exc}"
+        ) from original_exc
+
+    # run.bat starts in the repo directory, normally a short ASCII-only path.
+    # The source and its original name are never modified.
+    try:
+        temporary = tempfile.TemporaryDirectory(
+            prefix="excel_ascii_",
+            dir=str(Path.cwd()),
+        )
+    except OSError:
+        temporary = tempfile.TemporaryDirectory(prefix="excel_ascii_")
+
+    staged_path = Path(temporary.name) / ("workbook" + input_path.suffix)
+    try:
+        shutil.copyfile(input_path, staged_path)
+        print(f"  Retrying Excel open from ASCII-named copy: {staged_path}")
+        workbook = excel.Workbooks.Open(str(staged_path), **options)
+        print("  ASCII staging succeeded; source bytes are unchanged.")
+        return workbook, temporary
+    except Exception as staged_exc:
+        temporary.cleanup()
+        raise RuntimeError(
+            "Excel could not open either the original workbook or a local "
+            "copy with an ASCII filename. Filename/path handling is "
+            "therefore not sufficient to explain the failure. Check "
+            "whether the source opens manually in Excel, whether it is "
+            "password-encrypted/rights-managed, and whether Excel shows "
+            "Protected View, a format warning, or a recovery dialog. "
+            "The agent did NOT attempt automatic repair, and it did NOT "
+            "modify the input workbook. "
+            f"Original error: {original_exc}. "
+            f"ASCII-copy error: {staged_exc}."
+        ) from staged_exc
 
 
 def _load_excel_com():
@@ -903,6 +1024,7 @@ def translate_excel_file(
 
     excel = None
     workbook = None
+    staging_dir = None
 
     total_cells = 0
     total_shapes = 0
@@ -931,25 +1053,9 @@ def translate_excel_file(
         print(f"Excel input        : {input_path}")
         print(f"Excel output       : {output_path}")
 
-        # Open the ORIGINAL workbook read-only first. This is substantially
-        # more reliable than copying the file with shutil and asking Excel to
-        # reopen the copied bytes, especially for files that are open in
-        # another Excel window, OneDrive/network files, and legacy formats.
-        try:
-            workbook = excel.Workbooks.Open(
-                str(input_path),
-                UpdateLinks=0,
-                ReadOnly=True,
-                IgnoreReadOnlyRecommended=True,
-                AddToMru=False,
-            )
-        except Exception as exc:
-            raise RuntimeError(
-                "Excel could not open the input workbook. "
-                "Close any password/protected/recovery dialogs and verify "
-                f"that Excel can open this file manually: {input_path}. "
-                f"Original COM error: {type(exc).__name__}: {exc}"
-            ) from exc
+        # Retry through an ASCII-named staging file only if opening the
+        # original path fails. Keep the staging directory until Excel exits.
+        workbook, staging_dir = _open_source_workbook(excel, input_path)
 
         source_format = workbook.FileFormat
 
@@ -1045,5 +1151,8 @@ def translate_excel_file(
                 excel.Quit()
             except Exception:
                 pass
+
+        if staging_dir is not None:
+            staging_dir.cleanup()
 
         pythoncom.CoUninitialize()
