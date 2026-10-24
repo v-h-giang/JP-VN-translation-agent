@@ -280,3 +280,44 @@ Garbage collection skips locked old files rather than aborting translation;
 any remaining stale checkpoint generation can be deleted once LibreOffice has
 closed, after a successful run. **Do not delete the checkpoint JSON or its
 referenced workbook before resuming a failed run.**
+
+## Rich-text preservation and reviewer notes
+
+Both backends keep strike-through text (deleted historical decisions must remain
+visible), bold, colored segments, italics, and font sizes wherever the document
+format exposes them. For UNO, original line breaks are reinserted as styled
+runs instead of flattening the entire cell. When rich-text structure cannot be
+recovered exactly, the translation stops rather than silently discarding
+formatting. Shape shrinking respects the relative sizes of styled text runs
+with a minimum of 8 pt. LibreOffice's visual overflow estimate is approximate.
+
+On successful completion, each workbook has a matching UTF-8 CSV in output:
+
+```text
+<workbook-name>.shape_review.csv
+```
+
+The report identifies sheet, object ID/name, shrink/resize action, original
+and resulting font size, width, and height. It includes a header even if
+no shapes were changed. Review these objects visually before publishing.
+
+Identity entries in `glossary.json`, such as `"API": "API"`,
+`"WBS": "WBS"`, and `"ID": "ID"`, mean keep that exact term.
+Japanese text containing Latin identifiers is skipped unless Vietnamese
+characters requiring translation are present. Technical literals are
+validated on model output and, if changed, translation is performed around
+protected terms rather than silently accepting altered identifiers.
+
+Contextual multi-segment data uses JSON strings to preserve literal
+backslashes, quotes, and line breaks. If the model fails to return
+complete ID-to-string mappings, the segment group falls back to safe,
+individual translations. Run regression tests with:
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest test_translation_batch.py -v
+```
+
+Checkpoints now incorporate the model name, glossary and batching/format
+algorithm revision. **Checkpoints produced by previous versions lacking this
+signature will not resume**: keep old files as a backup, but expect a full
+new translation when running this version against an old checkpoint.
