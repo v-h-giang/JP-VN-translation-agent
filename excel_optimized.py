@@ -12,7 +12,8 @@ from excel_translate import (
     _load_excel_com, _iter_text_cells, _extract_cell_runs, _extract_shape_runs,
     _write_cell_runs, _write_shape_runs, _fit_shape_text, _safe_get,
 )
-from translation_batch import translatable, translate_context_batch
+from translation_batch import translatable, translate_context_batch, literal_terms_from_glossary
+from shape_review import write_shape_review
 
 CHECKPOINT_INTERVAL = 75
 CHECKPOINT_VERSION = 1
@@ -34,7 +35,7 @@ def checkpoint_paths(output):
     )
 
 
-def load_checkpoint(source_hash, output):
+def load_checkpoint(source_hash, output, signature):
     book, manifest = checkpoint_paths(output)
     if not (book.exists() and manifest.exists()):
         return None
@@ -43,6 +44,7 @@ def load_checkpoint(source_hash, output):
         valid = (
             state.get("version") == CHECKPOINT_VERSION
             and state.get("source_hash") == source_hash
+            and state.get("translation_signature") == signature
             and state.get("checkpoint_hash") == digest(book)
         )
         if not valid:
@@ -55,7 +57,7 @@ def load_checkpoint(source_hash, output):
         return None
 
 
-def save_checkpoint(workbook, output, source_hash, done, cache, stats):
+def save_checkpoint(workbook, output, source_hash, done, cache, stats, signature, review):
     book, manifest = checkpoint_paths(output)
     candidate = book.with_name(book.stem + ".writing" + book.suffix)
     manifest_tmp = manifest.with_name(manifest.name + ".writing")
@@ -65,6 +67,8 @@ def save_checkpoint(workbook, output, source_hash, done, cache, stats):
     state = {
         "version": CHECKPOINT_VERSION,
         "source_hash": source_hash,
+        "translation_signature": signature,
+        "review": review,
         "checkpoint_hash": digest(candidate),
         "done": sorted(done),
         "cache": cache,
@@ -91,6 +95,7 @@ def iter_shapes(shapes, sheet_index, prefix=()):
             text = frame.Characters().Text
             if isinstance(text, str) and text.strip():
                 yield {
+                    "sheet": str(_safe_get(shape, "Parent", "") or ""),
                     "id": "S/{}/{}".format(
                         sheet_index, ".".join(map(str, address))
                     ),
@@ -110,6 +115,7 @@ def iter_items(workbook):
         for cell in _iter_text_cells(sheet):
             address = str(cell.Address)
             yield {
+                "sheet": str(sheet.Name),
                 "id": f"C/{si}/{address}",
                 "kind": "cell",
                 "target": cell,
@@ -124,19 +130,38 @@ def runs_for(item):
     return _extract_shape_runs(item["target"], item["text"])
 
 
-def write_item(item, runs, stats):
+def write_item(item, runs, stats, review):
+    target_text = "".join(run["text"] for run in runs)
     if item["kind"] == "cell":
-        _write_cell_runs(item["target"], runs)
+        if target_text != item["text"]:
+            _write_cell_runs(item["target"], runs)
         stats["cells"] += 1
     else:
-        _write_shape_runs(item["target"], runs)
-        shrunk, resized = _fit_shape_text(item["target"], runs)
+        if target_text != item["text"]:
+            shape = item["target"]
+            old_width, old_height = float(shape.Width), float(shape.Height)
+            old_font = _safe_get(shape.TextFrame.Characters().Font, "Size")
+            _write_shape_runs(shape, runs)
+            shrunk, resized = _fit_shape_text(shape, runs)
+            stats["shrunk"] += int(shrunk)
+            stats["resized"] += int(resized)
+            if shrunk or resized:
+                review.append({
+                    "backend": "excel", "sheet": item.get("sheet", ""),
+                    "object_id": item["id"],
+                    "object_name": str(_safe_get(shape, "Name", "") or ""),
+                    "actions": "+".join(x for x, flag in
+                                        (("shrunk", shrunk), ("resized", resized)) if flag),
+                    "original_font_pt": old_font,
+                    "result_font_pt": _safe_get(shape.TextFrame.Characters().Font, "Size"),
+                    "original_width": old_width, "result_width": float(shape.Width),
+                    "original_height": old_height, "result_height": float(shape.Height),
+                    "note": "Review resized/shrunk shape",
+                })
         stats["objects"] += 1
-        stats["shrunk"] += int(shrunk)
-        stats["resized"] += int(resized)
 
 
-def flush(batch, cache, done, stats, translate_func):
+def flush(batch, cache, done, stats, translate_func, review, glossary):
     if not batch:
         return
     unique = []
@@ -144,14 +169,16 @@ def flush(batch, cache, done, stats, translate_func):
     for item in batch:
         for run in item["runs"]:
             text = run["text"]
-            if not translatable(text):
+            if not translatable(text, literal_terms_from_glossary(glossary)):
                 cache[text] = text
             elif text not in cache and text not in seen:
                 seen.add(text)
                 unique.append(text)
 
     if unique:
-        translated = translate_context_batch(unique, translate_func)
+        translated = translate_context_batch(
+            unique, translate_func, literal_terms_from_glossary(glossary)
+        )
         if len(translated) != len(unique):
             raise RuntimeError("COM batch produced wrong number of results")
         cache.update(zip(unique, translated))
@@ -162,7 +189,7 @@ def flush(batch, cache, done, stats, translate_func):
             for run in item["runs"]
         ]
         try:
-            write_item(item, translated_runs, stats)
+            write_item(item, translated_runs, stats, review)
         except Exception as exc:
             raise RuntimeError(
                 f"Excel COM failed writing {item['kind']} "
@@ -171,7 +198,8 @@ def flush(batch, cache, done, stats, translate_func):
         done.add(item["id"])
 
 
-def translate_excel_optimized(input_path, output_path, translate_func, max_chars=1200):
+def translate_excel_optimized(input_path, output_path, translate_func,
+                              max_chars=1200, signature="", glossary=None):
     """COM equivalent of UNO sparse scan, dedup, contextual batches and resume."""
     input_path = Path(input_path).resolve()
     output_path = Path(output_path).resolve()
@@ -181,11 +209,13 @@ def translate_excel_optimized(input_path, output_path, translate_func, max_chars
         raise FileNotFoundError(input_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    glossary = glossary or {}
     source_hash = digest(input_path)
-    state = load_checkpoint(source_hash, output_path)
+    state = load_checkpoint(source_hash, output_path, signature)
     book_checkpoint, manifest = checkpoint_paths(output_path)
     done = set(state["done"]) if state else set()
     cache = dict(state["cache"]) if state else {}
+    review = list(state.get("review", [])) if state else []
     stats = dict(state["stats"]) if state else {
         "cells": 0, "objects": 0, "shrunk": 0, "resized": 0
     }
@@ -220,13 +250,13 @@ def translate_excel_optimized(input_path, output_path, translate_func, max_chars
                 nonlocal batch, pending_since_save
                 if not batch:
                     return
-                flush(batch, cache, done, stats, translate_func)
+                flush(batch, cache, done, stats, translate_func, review, glossary)
                 pending_since_save += len(batch)
                 batch = []
                 if pending_since_save >= CHECKPOINT_INTERVAL:
                     save_checkpoint(
                         workbook, output_path, source_hash,
-                        done, cache, stats,
+                        done, cache, stats, signature, review, signature, review,
                     )
                     pending_since_save = 0
 
@@ -254,6 +284,8 @@ def translate_excel_optimized(input_path, output_path, translate_func, max_chars
             )
             workbook.SaveCopyAs(str(candidate))
             os.replace(candidate, output_path)
+            report = write_shape_review(output_path, review)
+            print(f"Shape review report: {report}")
             print(
                 f"Excel complete: {stats}; cache={len(cache)}; "
                 f"resumed_skipped={resumed}"
