@@ -500,6 +500,8 @@ def translate_directory(
                     output_path=output_path,
                     translate_func=excel_translate_func,
                     max_chars=max_chars,
+                    model=MODEL,
+                    glossary=glossary,
                 )
             else:
                 raise RuntimeError(
