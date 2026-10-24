@@ -118,6 +118,20 @@ def get_runs(text_obj):
 
     # Preserve paragraph separators as separate styled runs if UNO portions
     # omit them; do not flatten mixed styles across lines.
+    if not runs:
+        # Some cell types expose a text cursor but no text portions.
+        # Capture their uniform character properties without flattening
+        # any known multi-style runs.
+        cursor = text_obj.createTextCursor()
+        cursor.gotoStart(False)
+        cursor.gotoEnd(True)
+        style = {}
+        for name in FONT_PROPERTIES:
+            encoded = _encode_style(get_prop(cursor, name))
+            if encoded is not None:
+                style[name] = encoded
+        return [{"text": full, "style": style}]
+
     joined = "".join(r["text"] for r in runs)
     if joined != full and runs:
         cursor = 0
