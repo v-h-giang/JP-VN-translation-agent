@@ -11,6 +11,7 @@ import time
 import traceback
 import unicodedata
 from translation_batch import translatable
+from rich_text_alignment import align_rich_text_runs, RichTextAlignmentError
 import uuid
 from pathlib import Path
 
@@ -116,12 +117,9 @@ def get_runs(text_obj):
     except Exception:
         runs = []
 
-    # Preserve paragraph separators as separate styled runs if UNO portions
-    # omit them; do not flatten mixed styles across lines.
+    # UNO paragraph enumeration may omit breaks or normalize newline
+    # separators. Align style portions conservatively, never flatten.
     if not runs:
-        # Some cell types expose a text cursor but no text portions.
-        # Capture their uniform character properties without flattening
-        # any known multi-style runs.
         cursor = text_obj.createTextCursor()
         cursor.gotoStart(False)
         cursor.gotoEnd(True)
@@ -132,29 +130,7 @@ def get_runs(text_obj):
                 style[name] = encoded
         return [{"text": full, "style": style}]
 
-    joined = "".join(r["text"] for r in runs)
-    if joined != full and runs:
-        cursor = 0
-        recovered = []
-        for run in runs:
-            fragment = run["text"]
-            position = full.find(fragment, cursor)
-            if position < cursor:
-                recovered = []
-                break
-            if position > cursor:
-                recovered.append({"text": full[cursor:position],
-                                  "style": dict(recovered[-1]["style"] if recovered else run["style"])})
-            recovered.append(run)
-            cursor = position + len(fragment)
-        if recovered and cursor < len(full):
-            recovered.append({"text": full[cursor:],
-                              "style": dict(recovered[-1]["style"])})
-        if recovered and "".join(x["text"] for x in recovered) == full:
-            runs = recovered
-    if len(runs) > MAX_RICH_RUNS or "".join(x["text"] for x in runs) != full:
-        raise RuntimeError("Cannot recover exact rich-text portions without losing formatting")
-    return runs
+    return align_rich_text_runs(full, runs)
 
 
 def set_style(cursor, style):
@@ -394,7 +370,7 @@ def _clean_old_checkpoint_books(output, keep=None):
             pass
 
 
-def checkpoint_save(document, output, source_hash, processed, cache, stats, filter_name, signature, review):
+def checkpoint_save(document, output, source_hash, processed, cache, stats, filter_name, signature, review, rich_text_warnings):
     # Never overwrite a checkpoint workbook. On Windows an old checkpoint
     # can be locked for the ENTIRE duration of resume because it is the
     # source file of the open UNO document.
@@ -419,6 +395,7 @@ def checkpoint_save(document, output, source_hash, processed, cache, stats, filt
         "input_sha256": source_hash,
         "translation_signature": signature,
         "review": review,
+        "rich_text_warnings": rich_text_warnings,
         "book_file": book.name,
         "book_sha256": new_hash,
         "processed": sorted(processed),
@@ -547,6 +524,7 @@ def main():
     processed = set(state["processed"]) if state else set()
     cache = dict(state["cache"]) if state else {}
     review = list(state.get("review", [])) if state else []
+    rich_text_warnings = list(state.get("rich_text_warnings", [])) if state else []
     stats = dict(state["stats"]) if state else {
         "cells": 0, "objects": 0, "shrunk": 0, "resized": 0,
     }
@@ -584,7 +562,8 @@ def main():
             if items_since_checkpoint >= interval:
                 checkpoint_save(
                     document, output, original_hash,
-                    processed, cache, stats, filter_name, signature, review
+                    processed, cache, stats, filter_name, signature, review,
+                    rich_text_warnings
                 )
                 items_since_checkpoint = 0
 
@@ -601,7 +580,30 @@ def main():
                     if item["id"] in processed:
                         skipped += 1
                         continue
-                    item["runs"] = get_runs(item["target"])
+                    try:
+                        item["runs"] = get_runs(item["target"])
+                    except RichTextAlignmentError as exc:
+                        # Preserve the source cell unchanged. Persist its ID
+                        # so a later restart does not repeatedly fail here.
+                        warning = {
+                            "sheet": sheet_name, "object_id": item["id"],
+                            "kind": item["kind"], "source_text": item["text"],
+                            "reason": str(exc),
+                        }
+                        rich_text_warnings.append(warning)
+                        processed.add(item["id"])
+                        items_since_checkpoint += 1
+                        send("log", text=(
+                            f"Needs manual review: {sheet_name} {item['id']}: {exc}"
+                        ))
+                        if items_since_checkpoint >= interval:
+                            checkpoint_save(
+                                document, output, original_hash,
+                                processed, cache, stats, filter_name,
+                                signature, review, rich_text_warnings
+                            )
+                            items_since_checkpoint = 0
+                        continue
                     if not item["runs"]:
                         continue
                     item["sheet"] = sheet_name
@@ -613,7 +615,8 @@ def main():
         if items_since_checkpoint:
             checkpoint_save(
                 document, output, original_hash,
-                processed, cache, stats, filter_name, signature, review
+                processed, cache, stats, filter_name, signature, review,
+                rich_text_warnings
             )
 
         # Publish final workbook only after all cells and shapes complete.
@@ -639,7 +642,7 @@ def main():
             send("log", text=f"Checkpoint manifest cleanup deferred: {exc}")
         _clean_old_checkpoint_books(output)
 
-        send("done", review=review, stats={
+        send("done", review=review, rich_text_warnings=rich_text_warnings, stats={
             **stats, "candidates_scanned": discovered,
             "resumed_skipped": skipped, "unique_strings": len(cache),
         })
