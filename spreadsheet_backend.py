@@ -21,6 +21,7 @@ from excel_translate import EXCEL_EXTENSIONS
 from excel_optimized import translate_excel_optimized
 from translation_batch import translate_context_batch, literal_terms_from_glossary, BATCH_ALGORITHM_VERSION
 from shape_review import write_shape_review
+from rich_text_review import write_rich_text_review
 
 
 BATCH_MAX_CHARS = 1100
@@ -280,6 +281,12 @@ def _libreoffice_translate(input_path, output_path, translate_func, max_chars, s
                 elif kind == "done":
                     report = write_shape_review(output_path, message.get("review", []))
                     print("Shape review report : " + str(report))
+                    skipped = message.get("rich_text_warnings", [])
+                    rich_report = write_rich_text_review(output_path, skipped)
+                    print("Rich-text review    : " + str(rich_report))
+                    if skipped:
+                        print(f"WARNING: {len(skipped)} cells/shapes kept untranslated "
+                              "to protect formatting; see rich-text review CSV.")
                     print("LibreOffice translation completed: " + str(message.get("stats", {})))
                     finished = True
                 else:
