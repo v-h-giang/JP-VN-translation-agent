@@ -238,10 +238,11 @@ def fit_shape(shape, translated_runs=None):
         if new_height > original_height:
             size.Height = new_height
             resized = True
+        did_shrink = new_font < base_size
         if resized:
             shape.setSize(size)
-            return "resized"
-        return "shrunk" if new_font < base_size else "unchanged"
+            return "shrunk+resized" if did_shrink else "resized"
+        return "shrunk" if did_shrink else "unchanged"
     except Exception as exc:
         if is_bridge_lost(exc):
             raise
@@ -485,7 +486,7 @@ def flush_batch(batch, cache, processed, stats, review):
             before_width, before_height = int(before.Width), int(before.Height)
             font_before = get_prop(shape.createTextCursor(), "CharHeight")
             outcome = fit_shape(shape, runs)
-            if outcome in ("shrunk", "resized"):
+            if "shrunk" in outcome or "resized" in outcome:
                 after = shape.getSize()
                 review.append({
                     "backend": "libreoffice", "sheet": item.get("sheet", ""),
@@ -498,9 +499,9 @@ def flush_batch(batch, cache, processed, stats, review):
                     "note": "UNO shape fitting is approximate; visually review",
                 })
             stats["objects"] += 1
-            if outcome == "shrunk":
+            if "shrunk" in outcome:
                 stats["shrunk"] += 1
-            elif outcome == "resized":
+            if "resized" in outcome:
                 stats["resized"] += 1
         elif item["kind"] == "cell":
             stats["cells"] += 1
