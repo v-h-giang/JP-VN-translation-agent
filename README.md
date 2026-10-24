@@ -321,3 +321,34 @@ Checkpoints now incorporate the model name, glossary and batching/format
 algorithm revision. **Checkpoints produced by previous versions lacking this
 signature will not resume**: keep old files as a backup, but expect a full
 new translation when running this version against an old checkpoint.
+
+
+## Safe UNO rich-text recovery and manual review
+
+UNO text-portion enumeration sometimes excludes paragraph separators or
+normalizes line endings. The translator now aligns styled portions with the
+complete text using a conservative character-level fallback. Mixed styles
+(including strike-through, bold, italic, colors and different font sizes)
+are retained rather than flattened into one style.
+
+If a specific cell/shape has a non-whitespace mismatch that cannot be aligned
+safely, **the original remains unchanged**. The cell/shape ID is recorded in
+the resumable checkpoint, and the workbook continues processing. At successful
+completion, the agent creates:
+
+```text
+<workbook-name>.rich_text_review.csv
+```
+
+This separate review CSV lists the sheet, cell/object ID, source text and
+reason. Entries represent **items deliberately left untranslated** to prevent
+format loss; they require manual review. An empty report contains only a
+header. The existing `.shape_review.csv` continues to track shrunk/resized
+objects. The existing checkpoint version and model/glossary signature remain
+unchanged, so the current checkpoint can resume after this fix.
+
+Run regression tests:
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest test_rich_text_alignment.py -v
+```
