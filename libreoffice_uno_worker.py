@@ -10,6 +10,7 @@ import sys
 import time
 import traceback
 import unicodedata
+from translation_batch import translatable
 import uuid
 from pathlib import Path
 
@@ -69,6 +70,20 @@ def is_bridge_lost(exc):
     ))
 
 
+def _encode_style(value):
+    if isinstance(value, (bool, int, float, str)):
+        return value
+    if hasattr(value, "typeName") and hasattr(value, "value"):
+        return {"uno_enum": value.typeName, "value": value.value}
+    return None
+
+
+def _decode_style(value):
+    if isinstance(value, dict) and "uno_enum" in value:
+        return uno.Enum(value["uno_enum"], value["value"])
+    return value
+
+
 def get_runs(text_obj):
     full = text_obj.getString()
     if not full:
@@ -87,8 +102,9 @@ def get_runs(text_obj):
                 style = {}
                 for name in FONT_PROPERTIES:
                     value = get_prop(part, name)
-                    if isinstance(value, (str, int, float, bool)):
-                        style[name] = value
+                    encoded = _encode_style(value)
+                    if encoded is not None:
+                        style[name] = encoded
                 if runs and runs[-1]["style"] == style:
                     runs[-1]["text"] += fragment
                 else:
@@ -100,16 +116,30 @@ def get_runs(text_obj):
     except Exception:
         runs = []
 
-    # UNO text portions may omit paragraph delimiters. Never lose text:
-    # fall back to a single run when reconstruction isn't exact.
+    # Preserve paragraph separators as separate styled runs if UNO portions
+    # omit them; do not flatten mixed styles across lines.
+    joined = "".join(r["text"] for r in runs)
+    if joined != full and runs:
+        cursor = 0
+        recovered = []
+        for run in runs:
+            fragment = run["text"]
+            position = full.find(fragment, cursor)
+            if position < cursor:
+                recovered = []
+                break
+            if position > cursor:
+                recovered.append({"text": full[cursor:position],
+                                  "style": dict(recovered[-1]["style"] if recovered else run["style"])})
+            recovered.append(run)
+            cursor = position + len(fragment)
+        if recovered and cursor < len(full):
+            recovered.append({"text": full[cursor:],
+                              "style": dict(recovered[-1]["style"])})
+        if recovered and "".join(x["text"] for x in recovered) == full:
+            runs = recovered
     if len(runs) > MAX_RICH_RUNS or "".join(x["text"] for x in runs) != full:
-        cursor = text_obj.createTextCursor()
-        style = {}
-        for name in FONT_PROPERTIES:
-            value = get_prop(cursor, name)
-            if isinstance(value, (str, int, float, bool)):
-                style[name] = value
-        return [{"text": full, "style": style}]
+        raise RuntimeError("Cannot recover exact rich-text portions without losing formatting")
     return runs
 
 
@@ -117,7 +147,7 @@ def set_style(cursor, style):
     for key, value in style.items():
         if key in FONT_PROPERTIES:
             try:
-                setattr(cursor, key, value)
+                setattr(cursor, key, _decode_style(value))
             except Exception:
                 pass
 
@@ -133,19 +163,6 @@ def replace_text(target, runs):
         cursor.goRight(len(run["text"]), True)
         set_style(cursor, run["style"])
         cursor.collapseToEnd()
-
-
-def translatable(value):
-    # Numeric, symbols and whitespace need no model call.
-    # Japanese-only text is already the requested output language.
-    if not value.strip():
-        return False
-    for char in value:
-        if unicodedata.category(char).startswith("L"):
-            code = ord(char)
-            if code <= 0x024F or 0x1E00 <= code <= 0x1EFF:
-                return True
-    return False
 
 
 def fit_shape(shape):
@@ -286,7 +303,7 @@ def _checkpoint_file_for_state(output, state):
     return output.with_name(filename)
 
 
-def load_checkpoint(source_hash, output):
+def load_checkpoint(source_hash, output, signature):
     _, manifest = checkpoint_paths(output)
     if not manifest.is_file():
         return None
@@ -297,6 +314,7 @@ def load_checkpoint(source_hash, output):
         if (
             state.get("version") != PROTOCOL_VERSION
             or state.get("input_sha256") != source_hash
+            or state.get("translation_signature") != signature
             or not book.is_file()
             or state.get("book_sha256") != checksum(book)
         ):
@@ -341,7 +359,7 @@ def _clean_old_checkpoint_books(output, keep=None):
             pass
 
 
-def checkpoint_save(document, output, source_hash, processed, cache, stats, filter_name):
+def checkpoint_save(document, output, source_hash, processed, cache, stats, filter_name, signature, review):
     # Never overwrite a checkpoint workbook. On Windows an old checkpoint
     # can be locked for the ENTIRE duration of resume because it is the
     # source file of the open UNO document.
@@ -364,6 +382,8 @@ def checkpoint_save(document, output, source_hash, processed, cache, stats, filt
     state = {
         "version": PROTOCOL_VERSION,
         "input_sha256": source_hash,
+        "translation_signature": signature,
+        "review": review,
         "book_file": book.name,
         "book_sha256": new_hash,
         "processed": sorted(processed),
@@ -390,7 +410,7 @@ def checkpoint_save(document, output, source_hash, processed, cache, stats, filt
     )
 
 
-def flush_batch(batch, cache, processed, stats):
+def flush_batch(batch, cache, processed, stats, review):
     if not batch:
         return
     unique = []
@@ -423,16 +443,35 @@ def flush_batch(batch, cache, processed, stats):
             for run in item["runs"]
         ]
         # Fail fast rather than publish an incomplete workbook.
-        replace_text(item["target"], runs)
-        if item["kind"] == "shape":
-            outcome = fit_shape(item["target"])
+        if "".join(x["text"] for x in runs) != item["text"]:
+            replace_text(item["target"], runs)
+        if item["kind"] == "shape" and "".join(x["text"] for x in runs) != item["text"]:
+            shape = item["target"]
+            before = shape.getSize()
+            before_width, before_height = int(before.Width), int(before.Height)
+            font_before = get_prop(shape.createTextCursor(), "CharHeight")
+            outcome = fit_shape(shape)
+            if outcome in ("shrunk", "resized"):
+                after = shape.getSize()
+                review.append({
+                    "backend": "libreoffice", "sheet": item.get("sheet", ""),
+                    "object_id": item["id"], "object_name": str(get_prop(shape, "Name") or ""),
+                    "actions": outcome,
+                    "original_font_pt": font_before,
+                    "result_font_pt": get_prop(shape.createTextCursor(), "CharHeight"),
+                    "original_width": before_width, "result_width": int(after.Width),
+                    "original_height": before_height, "result_height": int(after.Height),
+                    "note": "UNO shape fitting is approximate; visually review",
+                })
             stats["objects"] += 1
             if outcome == "shrunk":
                 stats["shrunk"] += 1
             elif outcome == "resized":
                 stats["resized"] += 1
-        else:
+        elif item["kind"] == "cell":
             stats["cells"] += 1
+        else:
+            stats["objects"] += 1
         processed.add(item["id"])
 
 
@@ -462,15 +501,17 @@ def main():
     output = Path(sys.argv[3]).resolve()
     original = Path(sys.argv[4]).resolve()
     interval = int(sys.argv[5])
+    signature = sys.argv[6]
     if interval < 1:
         raise RuntimeError("Checkpoint interval must be positive.")
 
     original_hash = checksum(original)
-    state = load_checkpoint(original_hash, output)
+    state = load_checkpoint(original_hash, output, signature)
     checkpoint_book, manifest = checkpoint_paths(output)
     workbook_path = Path(state["_checkpoint_path"]) if state else staging
     processed = set(state["processed"]) if state else set()
     cache = dict(state["cache"]) if state else {}
+    review = list(state.get("review", [])) if state else []
     stats = dict(state["stats"]) if state else {
         "cells": 0, "objects": 0, "shrunk": 0, "resized": 0,
     }
@@ -502,13 +543,13 @@ def main():
             nonlocal batch, items_since_checkpoint
             if not batch:
                 return
-            flush_batch(batch, cache, processed, stats)
+            flush_batch(batch, cache, processed, stats, review)
             items_since_checkpoint += len(batch)
             batch = []
             if items_since_checkpoint >= interval:
                 checkpoint_save(
                     document, output, original_hash,
-                    processed, cache, stats, filter_name
+                    processed, cache, stats, filter_name, signature, review, signature, review
                 )
                 items_since_checkpoint = 0
 
@@ -528,6 +569,7 @@ def main():
                     item["runs"] = get_runs(item["target"])
                     if not item["runs"]:
                         continue
+                    item["sheet"] = sheet_name
                     batch.append(item)
                     if len(batch) >= interval:
                         flush()
@@ -562,7 +604,7 @@ def main():
             send("log", text=f"Checkpoint manifest cleanup deferred: {exc}")
         _clean_old_checkpoint_books(output)
 
-        send("done", stats={
+        send("done", review=review, stats={
             **stats, "candidates_scanned": discovered,
             "resumed_skipped": skipped, "unique_strings": len(cache),
         })
