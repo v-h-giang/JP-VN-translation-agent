@@ -165,7 +165,7 @@ def replace_text(target, runs):
         cursor.collapseToEnd()
 
 
-def fit_shape(shape):
+def fit_shape(shape, translated_runs=None):
     try:
         text = shape.getString()
         if not text.strip():
@@ -193,7 +193,27 @@ def fit_shape(shape):
         )
         new_font = max(MIN_FONT_PT, font * scale)
         if new_font < font:
-            cursor.CharHeight = float(new_font)
+            scale_factor = new_font / font
+            if translated_runs:
+                # Keep per-run relative font sizes, bold, strikeout and color.
+                start = shape.createTextCursor()
+                start.gotoStart(False)
+                for run in translated_runs:
+                    n = len(run["text"])
+                    if not n:
+                        continue
+                    start.goRight(n, True)
+                    original_pt = run["style"].get("CharHeight")
+                    if isinstance(original_pt, (int, float)) and original_pt > 0:
+                        try:
+                            start.CharHeight = max(
+                                MIN_FONT_PT, float(original_pt) * scale_factor
+                            )
+                        except Exception:
+                            pass
+                    start.collapseToEnd()
+            else:
+                cursor.CharHeight = float(new_font)
             font = new_font
         new_width = int(width_units * font * unit_to_mm100 * 1.10)
         new_height = int(len(lines) * font * unit_to_mm100 * 1.5)
@@ -450,7 +470,7 @@ def flush_batch(batch, cache, processed, stats, review):
             before = shape.getSize()
             before_width, before_height = int(before.Width), int(before.Height)
             font_before = get_prop(shape.createTextCursor(), "CharHeight")
-            outcome = fit_shape(shape)
+            outcome = fit_shape(shape, runs)
             if outcome in ("shrunk", "resized"):
                 after = shape.getSize()
                 review.append({
