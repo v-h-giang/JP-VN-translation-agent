@@ -256,7 +256,7 @@ def translate_excel_optimized(input_path, output_path, translate_func,
                 if pending_since_save >= CHECKPOINT_INTERVAL:
                     save_checkpoint(
                         workbook, output_path, source_hash,
-                        done, cache, stats, signature, review, signature, review,
+                        done, cache, stats, signature, review,
                     )
                     pending_since_save = 0
 
@@ -275,7 +275,7 @@ def translate_excel_optimized(input_path, output_path, translate_func,
             if pending_since_save:
                 save_checkpoint(
                     workbook, output_path, source_hash,
-                    done, cache, stats,
+                    done, cache, stats, signature, review,
                 )
 
             # Publish only a full workbook, never partial state.
