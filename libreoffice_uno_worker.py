@@ -549,7 +549,7 @@ def main():
             if items_since_checkpoint >= interval:
                 checkpoint_save(
                     document, output, original_hash,
-                    processed, cache, stats, filter_name, signature, review, signature, review
+                    processed, cache, stats, filter_name, signature, review
                 )
                 items_since_checkpoint = 0
 
@@ -578,7 +578,7 @@ def main():
         if items_since_checkpoint:
             checkpoint_save(
                 document, output, original_hash,
-                processed, cache, stats, filter_name
+                processed, cache, stats, filter_name, signature, review
             )
 
         # Publish final workbook only after all cells and shapes complete.
