@@ -8,5 +8,15 @@
   "xóa": "削除",
   "lấy dữ liệu": "データ取得",
   "validation": "バリデーション",
-  "Phương châm": "方針"
+  "Phương châm": "方針",
+  "API": "API",
+  "WBS": "WBS",
+  "ID": "ID",
+  "HTTP": "HTTP",
+  "URL": "URL",
+  "SQL": "SQL",
+  "AWS": "AWS",
+  "JSON": "JSON",
+  "Excel": "Excel",
+  "Git": "Git"
 }
